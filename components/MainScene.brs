@@ -71,23 +71,8 @@ sub init()
     m.libraryScreen.ObserveField("pushRequest", "onLibraryAction")
     m.uiRoot = m.top.FindNode("uiRoot")
     m.faultStrip = m.top.FindNode("faultStrip")
+    m.libraryWriteCoordinator = m.top.FindNode("libraryWriteCoordinator")
     m.top.FindNode("background").color = Theme().screenBg
-
-    ' "Is an account write-back worker in flight" for the single stremio pump.
-    ' It MUST be initialized here, not lazily, and this is not a style
-    ' preference: a field that was never assigned reads back as invalid, and
-    ' Roku refuses a truthiness test on invalid with &h18 ("Invalid is used in
-    ' IF-clause") on the render thread. The pump reads it on its first line,
-    ' before anything writes it, so an uninitialized flag is a guaranteed crash
-    ' the first time a push runs.
-    '
-    ' The brs test interpreter treats `if invalid` as false, so the suite is
-    ' structurally blind to this and a green run is not evidence either way. That
-    ' is what made the missing initialization survive review: it presented on
-    ' device as an unrecoverable app-wide hang when the player published a
-    ' position on pause or on leave, because the throw landed inside the player's
-    ' Video "state" observer and could not even paint a debugger prompt.
-    m.pushingLibraryWrite = false
 
     ' Same contract for the addon-collection pump: one flight at a time, and
     ' the flag exists precisely so an unassigned read can never happen on the
@@ -96,11 +81,6 @@ sub init()
     m.addonWriteTask = invalid
     m.addonWriteStamp = 0
 
-    ' The watch-state push is launched off a timer, not off the publisher that
-    ' reports it: the publisher is the player's Video "state" observer, and a
-    ' node created on that stack wedges the player (see ScheduleWatchStatePush).
-    m.watchStatePump = m.top.FindNode("watchStatePump")
-    m.watchStatePump.ObserveField("fire", "onWatchStatePumpFire")
     ' Settings can start the link-code flow; logout reuses the pairing worker.
     ' Both flags are session-flow state with no store counterpart.
     m.loginFromSettings = false
@@ -167,6 +147,7 @@ sub init()
     ' re-targets the session-aware stores in place through SwitchSession.
     m.storeHost = CreateObject("roSGNode", "StoreHost")
     m.top.AppendChild(m.storeHost)
+    m.libraryWriteCoordinator.callFunc("SetStoreHost", m.storeHost)
 
     ' The keys the last add-on sync published into the strip. Held so a later
     ' sync can retract exactly what it published: the reason strings carry the
@@ -272,160 +253,24 @@ sub onStreamsAction()
     m.stack.push(request.screen, request.params)
 end sub
 
-' The player published a position update (pause or leave) through
-' watchStateUpdate. It is one of the three account edits MainScene funnels into
-' the single write-back pump (see PumpLibraryWrites). Here: gate on a stremio
-' session (guest never touches the API), drop a repeat of the last accepted
-' update (same video, same position — nothing new), and record the rest in the
-' pending slot. The packet is read from the shared watch-state buffer, not the
-' player node, so the deferred pump can still build after the player is popped.
+' Screens and the player still publish through their existing fields. MainScene
+' is the event boundary and forwards each plain-data change to the coordinator
+' that owns queueing, serialization, task lifecycle, and the deferred player
+' write.
 sub onWatchStateUpdate()
-    if m.storeHost = invalid then return
-    if m.storeHost.callFunc("AuthGetSession") <> "stremio" then return
-    packet = m.storeHost.callFunc("WatchLatest")
-    if packet = invalid then return
-    videoId = packet.videoId
-    if videoId = invalid or videoId = "" then return
-    if packet.position = invalid then return
-    key = videoId + "|" + packet.position.ToStr()
-    if m.lastPacketKey = key then return
-    m.lastPacketKey = key
-    m.pendingWatchState = packet
-    ScheduleWatchStatePush()
+    if m.libraryWriteCoordinator <> invalid then m.libraryWriteCoordinator.callFunc("OnWatchStateUpdate")
 end sub
 
-' The watch-state push is the one account edit the PLAYER triggers from inside a
-' Video "state" observer: pausing reports "paused", leaving reports through
-' SavePosition, and both end up writing the watchStateUpdate field that wakes
-' this handler. So the stack under this call is the OS's own playback
-' transition, and nothing that touches the SceneGraph may run on it.
-'
-' It used to. onWatchStateUpdate called the pump directly, which built a worker
-' with CreateObject + AppendChild + control = "RUN" — inserting a node under a
-' Video node mid-transition, on the render thread. The app stopped answering the
-' remote entirely, and never recovered: pausing froze it, backing out of a
-' frozen pause froze it the same way, and the only way out was killing the
-' channel. It looked like a media or stream fault and was not one at all — it
-' reproduced on a stream from the user's own server, and never in a guest
-' session, because a guest session returns at the AuthGetSession gate above and
-' never reaches the launch. Only a stremio session got far enough to wedge.
-'
-' So the packet is RECORDED here and the push starts one tick later, off the
-' timer, after the transition has settled. That is safe to defer: the pump reads
-' the packet out of m.pendingWatchState, which lives past the player node, so a
-' pump that fires after the player was already torn down still has what it needs.
-sub ScheduleWatchStatePush()
-    if m.watchStatePump = invalid then
-        ' No timer to defer onto. Push inline rather than never — a missing timer
-        ' is a wiring mistake, not a reason to drop the user's watch state.
-        PumpLibraryWrites()
-        return
-    end if
-    m.watchStatePump.control = "stop"
-    m.watchStatePump.control = "start"
-end sub
-
-sub onWatchStatePumpFire()
-    PumpLibraryWrites()
-end sub
-
-' The Details screen published an add/remove toggle through libraryChange.
 sub onLibraryChange()
-    if m.storeHost = invalid then return
-    if m.storeHost.callFunc("AuthGetSession") <> "stremio" then return
+    if m.libraryWriteCoordinator = invalid or m.detailsScreen = invalid then return
     change = m.detailsScreen.libraryChange
-    if change = invalid then return
-    m.pendingLibraryChange = change
-    PumpLibraryWrites()
+    if change <> invalid then m.libraryWriteCoordinator.callFunc("OnLibraryChange", change)
 end sub
 
-' The episode browser published a watched-mark/unmark edit through
-' watchedChange. Each change carries the ordered episode-id list plus the meta
-' identity, so the store can re-author the full bitfield and land a well-formed
-' entry for a series the account has never seen.
 sub onWatchedChange()
-    if m.storeHost = invalid then return
-    if m.storeHost.callFunc("AuthGetSession") <> "stremio" then return
+    if m.libraryWriteCoordinator = invalid or m.episodesScreen = invalid then return
     change = m.episodesScreen.watchedChange
-    if change = invalid then return
-    m.pendingWatchedChange = change
-    PumpLibraryWrites()
-end sub
-
-' ---- the account-library write-back pump ------------------------------------
-'
-' Every stremio account edit — the player's position, the episode browser's
-' watched marks, Details' add/remove toggle — flows through ONE worker and one
-' build path. Two reasons this is a single pipeline and not three:
-'
-'   Serialization. The store commits each built item back into its cached
-'   library (LibraryStore.CommitStremioItem, mirroring stremio-core's
-'   update_and_push_items_to_storage). Two pushes overlapping would both clone
-'   the same stale copy and the later one would revert the earlier — exactly the
-'   bug closed here, where an add-to-library push wiped the watched bitfield a
-'   moment after it was written. One worker at a time means every build reads
-'   what the previous push committed, and it keeps the device's low concurrent-
-'   connection ceiling in view.
-'
-'   Consistency. The three edits differ only in the patch they apply; the
-'   resolve-clone-commit build and the datastorePut worker are identical, so
-'   there is one place to get the write-back right.
-'
-' Position and watched each keep a single pending slot (a newer edit supersedes
-' an unstarted older one); membership keeps the newest toggle. NextLibraryWrite
-' drains them in a fixed order and hands back the built item.
-sub PumpLibraryWrites()
-    if m.pushingLibraryWrite then return
-    if m.storeHost = invalid then return
-    job = NextLibraryWrite()
-    if job = invalid then return
-    task = AsyncTask_Launch(m.top, "LibraryPutTask", "onLibraryWriteResult", {
-        authKey: m.storeHost.callFunc("AuthGetAuthKey")
-        item: job.item
-    }, "libraryPutTask")
-    m.libraryWriteTask = task
-    m.inFlightLibraryWrite = job
-    m.pushingLibraryWrite = true
-end sub
-
-' Consume the next pending edit, highest priority first, and build its
-' LibraryItem through the store (which also commits it into the cached library).
-' Returns { item, kind } or invalid when nothing is pending. A slot whose build
-' comes back invalid (guest session, malformed packet) is simply dropped and the
-' next one tried.
-function NextLibraryWrite() as dynamic
-    if m.pendingWatchState <> invalid
-        packet = m.pendingWatchState
-        m.pendingWatchState = invalid
-        item = m.storeHost.callFunc("LibraryBuildWatchStateItem", packet)
-        if item <> invalid then return { item: item, kind: "watchState" }
-    end if
-    if m.pendingWatchedChange <> invalid
-        change = m.pendingWatchedChange
-        m.pendingWatchedChange = invalid
-        item = m.storeHost.callFunc("LibraryBuildWatchedStateItem", change)
-        if item <> invalid then return { item: item, kind: "watched" }
-    end if
-    if m.pendingLibraryChange <> invalid
-        change = m.pendingLibraryChange
-        m.pendingLibraryChange = invalid
-        item = m.storeHost.callFunc("LibraryBuildLibraryChangeItem", change.metaId, change.metaType, change.name, change.poster, change.added)
-        if item <> invalid then return { item: item, kind: "libraryChange" }
-    end if
-    return invalid
-end function
-
-' One push settled. Free the worker and pump whatever arrived meanwhile.
-' Failures are non-fatal: the store already committed the change to its cached
-' library, so the local view is authoritative and the next account sync
-' re-adopts whatever the server settled on.
-sub onLibraryWriteResult()
-    task = m.libraryWriteTask
-    m.libraryWriteTask = invalid
-    m.pushingLibraryWrite = false
-    if task <> invalid then AsyncTask_Reap(task, m.top, false)
-    m.inFlightLibraryWrite = invalid
-    PumpLibraryWrites()
+    if change <> invalid then m.libraryWriteCoordinator.callFunc("OnWatchedChange", change)
 end sub
 
 ' ---- the account add-on collection write-back pump --------------------------

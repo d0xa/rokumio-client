@@ -5673,102 +5673,96 @@ function checkWatchStatePushContract() {
     const fs = require('fs');
     const read = (f) => fs.readFileSync(path.join(projectRoot, f), 'utf8');
     const main = read('components/MainScene.brs');
-    const xml = read('components/MainScene.xml');
+    const sceneXml = read('components/MainScene.xml');
+    const coordinator = read('components/LibraryWriteCoordinator.brs');
+    const coordinatorXml = read('components/LibraryWriteCoordinator.xml');
     const player = read('components/PlayerScreen.brs');
     let ok = true;
     const err = (m) => { console.error(m); ok = false; };
     const code = (src) => src.split('\n').map(line => line.split("'")[0]).join('\n');
-    const brs = code(main);
-    const body = (name) => {
-        const m = new RegExp(`^(?:sub|function) ${name}\\(\\)`, 'm').exec(brs);
+    const sceneCode = code(main);
+    const coordinatorCode = code(coordinator);
+    const body = (src, name) => {
+        const m = new RegExp(`^(?:sub|function) ${name}\\([^\\n]*`, 'm').exec(src);
         if (!m) return '';
-        const lines = brs.slice(m.index).split('\n');
+        const lines = src.slice(m.index).split('\n');
         for (let i = 0; i < lines.length; i++) {
             if (i > 0 && /^end (?:sub|function)\b/.test(lines[i])) return lines.slice(0, i + 1).join('\n');
         }
-        return brs.slice(m.index);
+        return src.slice(m.index);
     };
 
-    // 1. The handler that the player's Video observer feeds must not build a
-    //    node. This is the whole defect.
-    const handler = body('onWatchStateUpdate');
-    if (!handler) {
-        err('MainScene.brs has no onWatchStateUpdate — the watch-state write-back has no entry point');
-    } else {
-        if (/AsyncTask_Launch\s*\(/.test(handler)) {
-            err('MainScene.brs onWatchStateUpdate launches the push worker itself — this handler runs inside the player\'s Video "state" observer, and creating a node on that stack is what froze playback. Go through ScheduleWatchStatePush.');
-        }
-        if (/CreateObject\s*\(/.test(handler)) {
-            err('MainScene.brs onWatchStateUpdate calls CreateObject — nothing on the Video state observer\'s stack may build a node');
-        }
-        if (!/ScheduleWatchStatePush\(\)/.test(handler)) {
-            err('MainScene.brs onWatchStateUpdate does not defer through ScheduleWatchStatePush — the push would start on the Video state observer\'s stack');
-        }
-        // The gate that made this stremio-only, and the reason "works in guest"
-        // proved nothing about it. Matched as a callFunc ARGUMENT — "AuthGet"
-        // followed by a closing paren is a direct call, and this is a string
-        // inside one.
-        if (!/callFunc\(\s*"AuthGetSession"\s*\)\s*<>\s*"stremio"/.test(handler)) {
-            err('MainScene.brs onWatchStateUpdate lost its stremio-session gate — a guest session would now do the write-back this bug lived in');
+    // The Scene is still the field observer, but only forwards the event. The
+    // coordinator owns all account-write state and task creation.
+    const sceneHandler = body(sceneCode, 'onWatchStateUpdate');
+    if (!/m\.libraryWriteCoordinator\.callFunc\("OnWatchStateUpdate"\)/.test(sceneHandler)) {
+        err('MainScene.onWatchStateUpdate must forward to LibraryWriteCoordinator');
+    }
+    for (const forbidden of ['CreateObject', 'AppendChild', 'AsyncTask_Launch']) {
+        if (new RegExp(`\\b${forbidden}\\s*\\(`).test(sceneHandler)) {
+            err(`MainScene.onWatchStateUpdate calls ${forbidden} — the Video state observer must not create or launch work`);
         }
     }
 
-    // 2. The deferral has to be real: a one-shot timer, actually observed, and
-    //    actually restarted per publish (a burst of pause/seek reports must not
-    //    launch a worker per report).
-    const schedule = body('ScheduleWatchStatePush');
-    if (!schedule) {
-        err('MainScene.brs has no ScheduleWatchStatePush — the deferral the player fix depends on is gone');
-    } else {
-        if (!/m\.watchStatePump\.control\s*=\s*"stop"[\s\S]{0,120}?m\.watchStatePump\.control\s*=\s*"start"/.test(schedule)) {
-            err('MainScene.brs ScheduleWatchStatePush does not (re)start the one-shot pump timer — a timer that is never restarted pushes nothing, silently dropping every watch state');
+    // The coordinator reads the buffered packet (not the player node), gates
+    // account-only writes, dedupes, and defers the worker off the Video event.
+    const handler = body(coordinatorCode, 'OnWatchStateUpdate');
+    if (!/callFunc\("AuthGetSession"\)\s*<>\s*"stremio"/.test(handler)) {
+        err('LibraryWriteCoordinator.OnWatchStateUpdate lost its stremio-session gate');
+    }
+    if (!/callFunc\("WatchLatest"\)/.test(handler) || !/m\.pendingWatchState\s*=\s*packet/.test(handler)) {
+        err('LibraryWriteCoordinator must read WatchLatest and retain the packet beyond the player node lifetime');
+    }
+    if (!/ScheduleWatchStatePush\(\)/.test(handler)) {
+        err('LibraryWriteCoordinator.OnWatchStateUpdate must defer task creation off the Video state observer');
+    }
+    const schedule = body(coordinatorCode, 'ScheduleWatchStatePush');
+    if (!/m\.watchStatePump\.control\s*=\s*"stop"[\s\S]{0,120}?m\.watchStatePump\.control\s*=\s*"start"/.test(schedule)) {
+        err('LibraryWriteCoordinator.ScheduleWatchStatePush must restart the one-shot coalescing timer');
+    }
+    if (!/m\.watchStatePump\s*=\s*invalid[\s\S]{0,200}?Pump\(\)/.test(schedule)) {
+        err('LibraryWriteCoordinator must keep the inline fallback if its deferral timer is missing');
+    }
+    if (!/m\.watchStatePump\.ObserveField\(\s*"fire"\s*,\s*"onWatchStatePumpFire"\s*\)/.test(coordinatorCode) || !/Pump\(\)/.test(body(coordinatorCode, 'onWatchStatePumpFire'))) {
+        err('LibraryWriteCoordinator must observe the timer and pump on its fire');
+    }
+    if (!/<Timer\s+id="watchStatePump"[^>]*duration="1"/.test(coordinatorXml) || !/<Timer\s+id="watchStatePump"[^>]*repeat="false"/.test(coordinatorXml)) {
+        err('LibraryWriteCoordinator.xml must declare a one-shot, one-tick watchStatePump timer');
+    }
+    const pump = body(coordinatorCode, 'Pump');
+    if (!/if m\.pushing then return/.test(pump) || !/NextWrite\(\)/.test(pump) || !/AsyncTask_Launch\(m\.top,\s*"LibraryPutTask"/.test(pump)) {
+        err('LibraryWriteCoordinator.Pump must serialize LibraryPutTask launches through the single-flight guard and NextWrite');
+    }
+    if (!/packet\s*=\s*m\.pendingWatchState\b/.test(body(coordinatorCode, 'NextWrite'))) {
+        err('LibraryWriteCoordinator.NextWrite must build the deferred packet from its own pending slot');
+    }
+    if (!/m\.libraryWriteCoordinator\.callFunc\("SetStoreHost",\s*m\.storeHost\)/.test(sceneCode) || !/<function\s+name="SetStoreHost"\s*\/>/.test(coordinatorXml)) {
+        err('MainScene must hand the StoreHost NODE to LibraryWriteCoordinator through its declared setup function');
+    }
+    for (const [handlerName, screenField, method] of [
+        ['onLibraryChange', 'm.detailsScreen.libraryChange', 'OnLibraryChange'],
+        ['onWatchedChange', 'm.episodesScreen.watchedChange', 'OnWatchedChange']
+    ]) {
+        const forwarded = body(sceneCode, handlerName);
+        if (!forwarded.includes(screenField) || !forwarded.includes(`callFunc("${method}"`)) {
+            err(`MainScene.${handlerName} must forward ${screenField} to LibraryWriteCoordinator.${method}`);
         }
-        if (!/m\.watchStatePump\s*=\s*invalid[\s\S]{0,200}?PumpLibraryWrites\(\)/.test(schedule)) {
-            err('MainScene.brs ScheduleWatchStatePush has no inline fallback when the timer is missing — a wiring mistake would drop the user\'s watch state instead of pushing it');
-        }
-    }
-    if (!/PumpLibraryWrites\(\)/.test(body('onWatchStatePumpFire') || '')) {
-        err('MainScene.brs onWatchStatePumpFire does not pump — the deferral would resolve to nothing');
-    }
-    if (!/m\.watchStatePump\.ObserveField\(\s*"fire"\s*,\s*"onWatchStatePumpFire"\s*\)/.test(brs)) {
-        err('MainScene.brs never observes the watchStatePump timer\'s fire field — the deferred push would never run');
-    }
-    if (!/<Timer\s+id="watchStatePump"[^>]*duration="1"/.test(xml)) {
-        err('MainScene.xml has no <Timer id="watchStatePump" duration="1" ... /> — a FindNode miss means the deferral silently degrades to the inline push that froze the player');
-    }
-    if (!/<Timer\s+id="watchStatePump"[^>]*repeat="false"/.test(xml)) {
-        err('MainScene.xml watchStatePump must be repeat="false" — a repeating one-shot pump would re-run forever and keep launching workers');
     }
 
-    // 3. The deferred pump must carry the packet across the gap on state THIS
-    //    scene owns, never on the player node: by the time a deferred pump
-    //    runs, a Back-out may already have popped and destroyed the player.
-    if (!/callFunc\(\s*"WatchLatest"\s*\)/.test(handler)) {
-        err('MainScene.brs onWatchStateUpdate no longer reads the packet out of the shared watch buffer via WatchLatest() — the whole point of the buffer is that it outlives the player node that published it');
-    }
-    if (!/NextLibraryWrite\(\)/.test(body('PumpLibraryWrites') || '')) {
-        err('MainScene.brs PumpLibraryWrites does not drain the pending edits through NextLibraryWrite — the three write-back kinds would have no single build path');
-    }
-    if (!/packet\s*=\s*m\.pendingWatchState\b/.test(body('NextLibraryWrite') || '')) {
-        err('MainScene.brs NextLibraryWrite no longer takes its packet from m.pendingWatchState — a deferred pump cannot re-read the player node, it can only use the slot the handler left it');
-    }
-
-    // 4. The publisher itself must stay trivial. It runs on the Video observer's
-    //    stack, so every line of it is a candidate for the same wedge.
+    // The publisher itself stays trivial: it runs inside the Video observer.
     const publish = /sub PublishWatchState\(\)[\s\S]*?\nend sub/.exec(code(player));
     if (!publish) {
         err('PlayerScreen.brs has no PublishWatchState');
     } else {
         for (const forbidden of ['CreateObject', 'AppendChild', 'AsyncTask_Launch', 'Wait(']) {
             if (new RegExp(`\\b${forbidden.replace('(', '\\(')}`).test(publish[0])) {
-                err(`PlayerScreen.brs PublishWatchState calls ${forbidden} — it runs inside the Video "state" observer, where anything but a local field write is what froze the player`);
+                err(`PlayerScreen.brs PublishWatchState calls ${forbidden} — it runs inside the Video state observer`);
             }
         }
         if (!/m\.top\.watchStateUpdate\s*=/.test(publish[0])) {
-            err('PlayerScreen.brs PublishWatchState no longer publishes through the watchStateUpdate field — MainScene\'s deferred pump is fed by that write');
+            err('PlayerScreen.brs PublishWatchState no longer publishes through watchStateUpdate');
         }
     }
-
     return ok;
 }
 
