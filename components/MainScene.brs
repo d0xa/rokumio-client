@@ -70,6 +70,7 @@ sub init()
     m.libraryScreen = m.top.FindNode("libraryScreen")
     m.libraryScreen.ObserveField("pushRequest", "onLibraryAction")
     m.uiRoot = m.top.FindNode("uiRoot")
+    m.faultStrip = m.top.FindNode("faultStrip")
     m.top.FindNode("background").color = Theme().screenBg
 
     ' "Is an account write-back worker in flight" for the single stremio pump.
@@ -167,44 +168,6 @@ sub init()
     m.storeHost = CreateObject("roSGNode", "StoreHost")
     m.top.AppendChild(m.storeHost)
 
-    ' The store-fault strip: a red bar plus its label, both flat children of the
-    ' Scene, created once up front and updated in place. No nesting, no
-    ' FindNode after an append, no string join — every way the first version
-    ' could come up with a blank label while the bar itself still painted. A
-    ' screen that cannot reach the data layer reports the failing hop here (see
-    ' Screen.brs's SetStores) rather than leaving an empty grid and a
-    ' "0 add-ons" that reads like an empty catalog. 0 is impossible with a live
-    ' store: a guest session's GetAll() returns the two built-in seeds.
-    m.faultBar = CreateObject("roSGNode", "Rectangle")
-    m.faultBar.width = 1920
-    m.faultBar.height = 80
-    m.faultBar.translation = [0, 1000]
-    m.faultBar.color = Theme().danger
-    m.faultBar.visible = false
-    m.top.AppendChild(m.faultBar)
-
-    m.faultText = CreateObject("roSGNode", "Label")
-    m.faultText.translation = [40, 1020]
-    m.faultText.width = 1840
-    m.faultText.height = 44
-    m.faultText.font = "font:MediumBoldSystemFont"
-    m.faultText.color = Theme().textWhite
-    m.faultText.visible = false
-    m.top.AppendChild(m.faultText)
-
-    ' Transient faults hold the strip for a few seconds and then dismiss
-    ' themselves, like a toast. A sync warning that outlived its cause read as
-    ' a permanent failure when it is nothing — a flaky connection, a retry the
-    ' next launch heals — which glued red lines to the screen for whole
-    ' sessions. The timer exists once and is restarted by every report, so a
-    ' stream of transient faults dismisses on ONE deadline, not per line; the
-    ' codec set runs on the render thread, where nothing else waits.
-    m.transientFaults = {}
-    m.faultTimer = CreateObject("roSGNode", "Timer")
-    m.faultTimer.duration = 5.0
-    m.faultTimer.repeat = false
-    m.faultTimer.ObserveField("fire", "onFaultTimerFire")
-
     ' The keys the last add-on sync published into the strip. Held so a later
     ' sync can retract exactly what it published: the reason strings carry the
     ' transport's error text, so a clear-by-same-text would leave a stale line
@@ -225,92 +188,18 @@ sub init()
     m.playerScreen.callFunc("SetStores", m.storeHost, m.top)
 end sub
 
-' A screen whose store bind came up short reports it here, and the Scene paints
-' it. Every way that hand-off can fail looks identical from the outside — an
-' empty grid, a "0 add-ons" subtitle, no crash, nothing in the device log — and
-' that silence is what hid two shipping bugs (the callFunc argument that arrived
-' without its methods, then getScene() returning invalid because init() runs
-' before Show()). The Scene owns the strip because it owns the cross-cutting UI
-' and has the palette; a screen that painted its own would need a color literal
-' it deliberately does not depend on.
-'
-' Faults are keyed by reason, not by screen: the four failures are exactly the
-' things worth reading, and a dozen screens hitting the same one should not
-' produce a dozen identical lines. active=false clears.
+' Screens already report store faults through MainScene's interface. Keep this
+' entry point stable; the FaultStrip component owns state, timer and painting.
 sub ReportStoreFault(reason as string, active as boolean)
-    if reason = "" then return
-    if m.storeFaults = invalid then m.storeFaults = {}
-    if active then
-        m.storeFaults[reason] = true
-    else
-        m.storeFaults.Delete(reason)
-    end if
-    RefreshStoreFaultStrip()
+    if m.faultStrip = invalid then return
+    m.faultStrip.callFunc("ReportStoreFault", reason, active)
 end sub
 
-' A transient fault: one the user needs to read once (launch sync failed,
-' an add-on change withheld, the wording of a rejected install) and that
-' heals on its own — the same reason a toast dies after a few seconds.
-' Compared with ReportStoreFault this starts the strip's dismissal timer;
-' a sticky fault arriving while the timer runs is unaffected (those clear
-' through their own active=false reports).
+' Transient reports stay internal to MainScene's sync paths, but use the same
+' component that owns their lease and display.
 sub ReportTransientFault(reason as string)
-    if reason = "" then return
-    m.transientFaults[reason] = true
-    m.faultTimer.control = "start"
-    RefreshStoreFaultStrip()
-end sub
-
-' The transient lease expired: transient lines go, sticky ones stay. The
-' timer's control is "stop" by its own fire, so nothing else to write here —
-' exactly one field write plus the repaint.
-sub onFaultTimerFire()
-    m.transientFaults = {}
-    RefreshStoreFaultStrip()
-end sub
-
-' One bar and one label, both created in init() and updated in place, so this
-' only ever writes two fields on nodes the Scene already holds. Sorted so the
-' same set of faults always reads the same way — an unordered key walk would
-' shuffle the lines between binds. Sticky and transient faults paint merged:
-' the union AA dedupes a wording that arrives in both classes, so one reason
-' is one line no matter who said it.
-'
-' The first version shipped one line that did all three of the things this
-' avoids: strip.FindNode("storeFaultText").text = reasons.Join("     ") — a
-' strip built lazily, a Label written through a FindNode after the append, and
-' the line joined. On device the bar painted and the label stayed blank. Which
-' of the three was at fault was never isolated, so none of the three shapes
-' come back. m.linkLabel.text = link in LinkStremioScreen is the shape known to
-' work here, so this is that shape.
-sub RefreshStoreFaultStrip()
-    shown = {}
-    if m.storeFaults <> invalid
-        for each key in m.storeFaults
-            shown[key] = true
-        end for
-    end if
-    for each key in m.transientFaults
-        shown[key] = true
-    end for
-    reasons = []
-    for each key in shown
-        reasons.Push(key)
-    end for
-    reasons.Sort()
-    line = ""
-    for each reason in reasons
-        if line <> "" then line = line + "     "
-        line = line + reason
-    end for
-    if line = "" then
-        m.faultBar.visible = false
-        m.faultText.visible = false
-        return
-    end if
-    m.faultText.text = line
-    m.faultText.visible = true
-    m.faultBar.visible = true
+    if m.faultStrip = invalid then return
+    m.faultStrip.callFunc("ReportTransientFault", reason)
 end sub
 
 ' The only action channel from Home: one push request, dispatched by the stack.
@@ -1218,11 +1107,10 @@ sub ClearAddonSyncFaults()
     if m.addonSyncFaults <> invalid
         for each key in m.addonSyncFaults
             ReportStoreFault(key, false)
-            m.transientFaults.Delete(key)
+            if m.faultStrip <> invalid then m.faultStrip.callFunc("ClearTransientFault", key)
         end for
     end if
     m.addonSyncFaults = []
-    RefreshStoreFaultStrip()
 end sub
 
 sub AddAddonSyncFault(reason as string)

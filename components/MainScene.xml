@@ -82,5 +82,10 @@
              One-shot and restarted per publish, so a burst of position reports
              coalesces into a single launch. -->
         <Timer id="watchStatePump" duration="1" repeat="false" />
+
+        <!-- Sticky store faults and short-lived sync warnings. The strip owns
+             its display nodes, state and dismissal timer; MainScene forwards
+             the reporting interface screens already use. -->
+        <FaultStrip id="faultStrip" />
     </children>
 </component>

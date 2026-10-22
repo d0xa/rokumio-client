@@ -556,83 +556,73 @@ function checkStoreHandoffContract() {
         }
     }
 
-    // --- a reported fault has to be painted ----------------------------------
+    // --- MainScene forwards the stable screen-facing API; FaultStrip owns it.
     if (!/<function\s+name="ReportStoreFault"\s*\/>/.test(sceneXml)) {
-        err('MainScene.xml must declare <function name="ReportStoreFault" /> — callFunc only runs for interface functions, so every screen\'s fault report would go nowhere');
+        err('MainScene.xml must declare ReportStoreFault() — screens report their bind failures through this stable interface');
     }
     const report = mainScene.match(/^sub\s+ReportStoreFault\s*\(/m);
     if (!report) {
-        err('MainScene.brs no longer defines ReportStoreFault — every screen\'s fault report would hit a non-function');
-    } else if (!/^\s*RefreshStoreFaultStrip\(\)\s*$/m.test(mainScene.slice(report.index))) {
-        err('MainScene.brs ReportStoreFault must CALL RefreshStoreFaultStrip — a fault recorded but never shown is the bug, not the fix');
+        err('MainScene.brs no longer defines ReportStoreFault — screens would report into nothing');
+    } else if (!/m\.faultStrip\.callFunc\("ReportStoreFault"/.test(bodyOf(mainScene, report[0]))) {
+        err('MainScene.ReportStoreFault must forward to FaultStrip; MainScene should not own the strip state');
     }
-    const paint = mainScene.match(/^sub\s+RefreshStoreFaultStrip\s*\(\)/m);
+    const sceneInit = mainScene.match(/^sub\s+init\s*\(\)\s*$/m);
+    const sceneInitBody = sceneInit ? bodyOf(mainScene, sceneInit[0]) : '';
+    if (!/m\.faultStrip\s*=\s*m\.top\.FindNode\("faultStrip"\)/.test(sceneInitBody) || !/<FaultStrip\s+id="faultStrip"/.test(sceneXml)) {
+        err('MainScene must hold the declared FaultStrip node — reporting through an absent node silently loses every fault');
+    }
+
+    const faultBrs = fs.readFileSync(path.join(dir, 'FaultStrip.brs'), 'utf8');
+    const faultXml = fs.readFileSync(path.join(dir, 'FaultStrip.xml'), 'utf8');
+    const faultDefined = new Set([...faultBrs.matchAll(/^(?:function|sub)\s+(\w+)\s*\(/gm)].map(m => m[1]));
+    const faultDeclared = new Set([...faultXml.matchAll(/<function\s+name="([^"]+)"/g)].map(m => m[1]));
+    for (const name of ['ReportStoreFault', 'ReportTransientFault', 'ClearTransientFault']) {
+        if (!faultDefined.has(name) || !faultDeclared.has(name)) {
+            err(`FaultStrip must define and declare ${name} — callFunc only reaches functions in the component interface`);
+        }
+    }
+    const faultInit = faultBrs.match(/^sub\s+init\s*\(\)\s*$/m);
+    const faultInitBody = faultInit ? bodyOf(faultBrs, faultInit[0]) : '';
+    if (!/m\.storeFaults\s*=\s*\{\}/.test(faultInitBody) || !/m\.transientFaults\s*=\s*\{\}/.test(faultInitBody)) {
+        err('FaultStrip init must initialize both fault maps — an unassigned AA is invalid, and iterating it is a render-thread crash');
+    }
+    for (const [field, node] of [['m.bar', 'Rectangle'], ['m.label', 'Label']]) {
+        if (!new RegExp(field + '\\s*=\\s*CreateObject\\(\\s*"roSGNode"\\s*,\\s*"' + node + '"').test(faultInitBody) || !new RegExp('m\\.top\\.AppendChild\\(' + field + '\\)').test(faultInitBody)) {
+            err(`FaultStrip init must create and attach ${field} (${node}) once — an unattached node renders nothing`);
+        }
+    }
+    const paint = faultBrs.match(/^sub\s+Refresh\s*\(\)\s*$/m);
     if (!paint) {
-        err('MainScene.brs no longer defines RefreshStoreFaultStrip — a reported fault would never reach the screen');
-        return ok;
-    }
-    const paintBody = bodyOf(mainScene, paint[0]);
-    const initHeader = mainScene.match(/^sub\s+init\s*\(\)\s*$/m);
-    const initBody = initHeader ? bodyOf(mainScene, initHeader[0]) : '';
-    for (const [field, node] of [['m.faultBar', 'Rectangle'], ['m.faultText', 'Label']]) {
-        if (!new RegExp(field + '\\s*=\\s*CreateObject\\(\\s*"roSGNode"\\s*,\\s*"' + node + '"').test(initBody)) {
-            err(`MainScene.brs init must create ${field} (${node}) — the strip is built once, up front`);
+        err('FaultStrip has no Refresh() — a reported fault would never be painted');
+    } else {
+        const paintBody = bodyOf(faultBrs, paint[0]);
+        if (/CreateObject\(|AppendChild\(|FindNode\(|\.Join\(/.test(paintBody)) {
+            err('FaultStrip.Refresh() must update its existing nodes directly, building the line by concatenation');
         }
-        if (!new RegExp('m\\.top\\.AppendChild\\(' + field + '\\)').test(initBody)) {
-            err(`MainScene.brs init must attach ${field} to the Scene — an unattached node renders nothing, which is the exact shape of the bug being fixed`);
+        if (!/m\.label\.text\s*=/.test(paintBody) || !/m\.bar\.visible\s*=/.test(paintBody) || !/m\.label\.visible\s*=/.test(paintBody)) {
+            err('FaultStrip.Refresh() must set the label and both visibility fields — otherwise a fault may paint as a blank bar');
         }
     }
-    // What the first version actually shipped was one line, and it is worth
-    // having on record because it is the shape that painted nothing:
-    //     strip.FindNode("storeFaultText").text = reasons.Join("     ")
-    // — a strip built lazily, a Label written through a FindNode after the
-    // append, and the line joined from an array. On device the bar painted and
-    // the label stayed blank. Which of the three was at fault was never
-    // isolated, so all three stay pinned out: the strip is created in init,
-    // written through the fields themselves, and the line is concatenated.
-    if (/CreateObject\(/.test(paintBody) || /AppendChild\(/.test(paintBody)) {
-        err('MainScene.brs RefreshStoreFaultStrip must only write to the strip nodes init() already built — creating or attaching a node at paint time is one of the three shapes that shipped as a blank label');
-    }
-    if (/FindNode\(/.test(paintBody)) {
-        err('MainScene.brs RefreshStoreFaultStrip must write to m.faultBar / m.faultText directly, not look them up by id — m.linkLabel.text = link in LinkStremioScreen is the shape known to render here');
-    }
-    if (!/m\.faultText\.text\s*=/.test(paintBody)) {
-        err('MainScene.brs RefreshStoreFaultStrip must set m.faultText.text — a bar with no text says nothing');
-    }
-    if (/\.Join\(/.test(paintBody)) {
-        err('MainScene.brs RefreshStoreFaultStrip must build the line by concatenation, not Join() over an array — the third of the three shapes that shipped as a blank label');
-    }
-    // Transient faults paint merged with the sticky ones and dismiss on one
-    // shared deadline. The launch/addon sync reporters route through
-    // ReportTransientFault; a sticky add-on-sync fault would glue a line to
-    // the screen that the next launch heals — the exact UX the transient
-    // class exists to replace.
-    if (!/m\.faultTimer\s*=\s*CreateObject\(\s*"roSGNode"\s*,\s*"Timer"/.test(initBody)) {
-        err('MainScene.brs init must create m.faultTimer (Timer) — the strip owns nothing else');
-    }
-    if (!/m\.transientFaults\s*=\s*\{\}/.test(initBody)) {
-        err('MainScene.brs init must start m.transientFaults = {} — an unassigned AA is invalid, and iterating it is a render-thread crash');
-    }
-    const transient = mainScene.match(/^sub\s+ReportTransientFault\s*\([^)]*\)\s*$/m);
+    const transient = faultBrs.match(/^sub\s+ReportTransientFault\s*\([^)]*\)\s*$/m);
     if (!transient) {
-        err('MainScene.brs no longer defines ReportTransientFault — every transient fault would need its own dismissal logic');
+        err('FaultStrip no longer defines ReportTransientFault');
     } else {
-        const transientBody = bodyOf(mainScene, transient[0]);
-        if (!/m\.faultTimer\.control\s*=\s*"start"/.test(transientBody) || !/RefreshStoreFaultStrip\(\)/.test(transientBody)) {
-            err('MainScene.brs ReportTransientFault must restart the timer and repaint — one deadlined strip for a stream of transient faults');
+        const body = bodyOf(faultBrs, transient[0]);
+        if (!/m\.timer\.control\s*=\s*"start"/.test(body) || !/Refresh\(\)/.test(body)) {
+            err('FaultStrip.ReportTransientFault must restart the shared timer and repaint');
         }
     }
-    const expiry = mainScene.match(/^sub\s+onFaultTimerFire\s*\(\)\s*$/m);
+    const expiry = faultBrs.match(/^sub\s+onDismissTimerFire\s*\(\)\s*$/m);
     if (!expiry) {
-        err('MainScene.brs no longer defines onFaultTimerFire — transient faults would outlive the strip');
+        err('FaultStrip no longer defines onDismissTimerFire — transient faults would outlive their deadline');
     } else {
-        const expiryBody = bodyOf(mainScene, expiry[0]);
-        if (!/m\.transientFaults\s*=\s*\{\}/.test(expiryBody) || !/RefreshStoreFaultStrip\(\)/.test(expiryBody)) {
-            err('MainScene.brs onFaultTimerFire must clear the transient slot and repaint');
+        const expiryBody = bodyOf(faultBrs, expiry[0]);
+        if (!/m\.transientFaults\s*=\s*\{\}/.test(expiryBody) || !/Refresh\(\)/.test(expiryBody)) {
+            err('FaultStrip.onDismissTimerFire must clear transient faults and repaint');
         }
     }
-    if (!/m\.transientFaults/.test(paintBody)) {
-        err('MainScene.brs RefreshStoreFaultStrip must paint the transient faults merged with the sticky ones — a fault line that only some classes reach is a fault line that lies');
+    if (!/m\.storeFaults/.test(faultBrs) || !/m\.transientFaults/.test(faultBrs)) {
+        err('FaultStrip must merge sticky and transient faults in its display');
     }
     const addonFault = mainScene.match(/^sub\s+AddAddonSyncFault\s*\([^)]*\)\s*$/m);
     if (!addonFault) {
