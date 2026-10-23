@@ -73,6 +73,7 @@ sub init()
     m.faultStrip = m.top.FindNode("faultStrip")
     m.libraryWriteCoordinator = m.top.FindNode("libraryWriteCoordinator")
     m.addonWriteCoordinator = m.top.FindNode("addonWriteCoordinator")
+    m.importCoordinator = m.top.FindNode("importCoordinator")
     m.top.FindNode("background").color = Theme().screenBg
 
     ' Settings can start the link-code flow; logout reuses the pairing worker.
@@ -143,6 +144,7 @@ sub init()
     m.top.AppendChild(m.storeHost)
     m.libraryWriteCoordinator.callFunc("SetStoreHost", m.storeHost)
     m.addonWriteCoordinator.callFunc("SetDependencies", m.storeHost, m.top)
+    m.importCoordinator.callFunc("SetScene", m.top)
 
     ' The keys the last add-on sync published into the strip. Held so a later
     ' sync can retract exactly what it published: the reason strings carry the
@@ -277,7 +279,7 @@ end sub
 
 ' THE one gateway every local add-on change flows through, whichever flow
 ' produced it — the add-on manager's screen channels (below) and the import
-' pipeline's own registers (onImportTaskResult) all land here. One place, so
+' coordinator's registered installs land here. One place, so
 ' there is exactly one rule: a stremio-session change happens in the local
 ' registry AND reaches the account through the mirror, or the fault strip
 ' names why it could not. Guest sessions have no account and stay silent;
@@ -995,27 +997,14 @@ end sub
 ' Rokumio-import runs sequentially — one AddonsInstallTask per manifest URL,
 ' each parked off the render thread (a hung add-on costs a worker, not the UI,
 ' exactly like the Addons screen) — then applies serverAddress and shows a
-' single summary. m.import doubles as the re-entrancy guard: a second deep link
-' while one runs is dropped.
+' single summary. ImportCoordinator owns the re-entrancy guard: a second deep
+' link while one runs is dropped.
 sub HandleDeepLink(args as object)
-    if args = invalid
-        return
-    end if
-    if m.import <> invalid
-        return
-    end if
-
-    keys = ""
-    for each key in args
-        if keys <> "" then keys = keys + ","
-        keys = keys + key
-    end for
+    if args = invalid then return
+    if m.importCoordinator.callFunc("IsBusy") then return
 
     parse = DeepLinkStore().Parse(args)
-
-    if parse.kind = "none"
-        return
-    end if
+    if parse.kind = "none" then return
     if parse.kind = "unknown"
         ShowImportDialog("importTitle", [{ key: "importUnsupported", values: { error: parse.error } }])
         return
@@ -1025,45 +1014,17 @@ sub HandleDeepLink(args as object)
         return
     end if
 
-    BeginImport(parse.addons, parse.settings)
+    m.importCoordinator.callFunc("StartImport", parse.addons, parse.settings)
 end sub
 
-' Start an add-on import: seed the single import slot and pump it. Both deep
-' links (above) and the local setup page (ImportFromSetup) land here, so there
-' can never be two import pipelines with two sets of counters and two dialogs
-' racing for the same add-on. Callers guard m.import <> invalid first — the
-' slot holds exactly one import at a time.
-sub BeginImport(addons as object, settings as dynamic)
-    m.import = {
-        pending: []
-        added: 0
-        skipped: 0
-        failed: 0
-        failures: []
-        task: invalid
-        settings: settings
-        requested: addons.Count()
-    }
-    for each url in addons
-        m.import.pending.Push(url)
-    end for
-    PumpImport()
-end sub
-
-' The local setup page (source/util/SetupPage.brs) hands off one manifest URL.
-' Returns whether it was queued: the page answers 200 with a "watch the TV"
-' page, or 409 with a "busy" page — never a dialog on this side (the import
-' summary that lands in ShowImportDialog is the TV's own confirmation).
+' The local setup page hands off one manifest URL. The coordinator owns the
+' same busy slot as HandleDeepLink, so the page can answer 409 while an import
+' is active and otherwise show its "watch the TV" response.
 function ImportFromSetup(url as dynamic) as boolean
-    if m.import <> invalid then return false
-    if url = invalid then return false
-    if url = "" then return false
-    BeginImport([url], invalid)
-    return true
+    if url = invalid or url = "" then return false
+    return m.importCoordinator.callFunc("StartImport", [url], invalid)
 end function
 
-' Address of the local setup page, published by main() at launch. Stored here
-' and pushed to the Add-ons screen, where the install workflow actually lives.
 sub ShowSetupAddress(url as dynamic)
     if url = invalid then return
     if url = "" then return
@@ -1072,109 +1033,53 @@ sub ShowSetupAddress(url as dynamic)
 end sub
 
 ' Start the next queued manifest fetch, or finish when the queue is empty.
-sub PumpImport()
-    if m.import = invalid then return
-    if m.import.task <> invalid then return
-    if m.import.pending.Count() > 0
-        url = m.import.pending.Shift()
-        task = AsyncTask_Launch(m.top, "AddonsInstallTask", "onImportTaskResult", { address: url }, "deepLinkInstall")
-        m.import.task = task
-        return
-    end if
-    FinishImport()
-end sub
+' The coordinator registers through this gateway, so imported add-ons reach the
+' same account mirror as AddonsScreen installs. The worker only fetched and
+' validated the manifest; the live AddonsStore remains the duplicate/persistence
+' authority.
+function ImportRegisterAddon(record as object, transportUrl as dynamic, manifest as dynamic) as boolean
+    if m.storeHost = invalid then return false
+    registered = m.storeHost.callFunc("AddonsRegister", record)
+    if registered then AccountAddonInstalled(transportUrl, manifest)
+    return registered
+end function
 
-' One manifest fetch settled. The task validated against a registry-less store,
-' so an already-installed id still comes back ok — the real duplicate gate runs
-' here, in AddonsStore.Register. That orders the counts: added, skipped
-' (duplicate/built-in), or failed.
-sub onImportTaskResult()
-    if m.import = invalid then return
-    task = m.import.task
-    if task = invalid then return
-    m.import.task = invalid
-    result = task.result
-    AsyncTask_Reap(task, m.top, false)
-
-    resultId = ""
-    resultError = ""
-    if result <> invalid
-        if result.id <> invalid then resultId = result.id
-        if result.error <> invalid then resultError = result.error
-    end if
-
-    if result <> invalid and result.ok and result.record <> invalid
-        registered = false
-        if m.storeHost <> invalid
-            registered = m.storeHost.callFunc("AddonsRegister", result.record)
-        end if
-        if registered
-            m.import.added = m.import.added + 1
-            ' The SAME gateway the add-on manager's own installs report
-            ' through: a registered import (deep link, setup page, companion)
-            ' must reach the account too, or the next launch sync would treat
-            ' it as local-only and prune it. No account, no fault — a guest
-            ' import is a device-only install by definition.
-            AccountAddonInstalled(result.transportUrl, result.manifest)
-        else
-            m.import.skipped = m.import.skipped + 1
-        end if
-    else
-        m.import.failed = m.import.failed + 1
-        ' The failure travels as DATA: the add-on's own error is the server's
-        ' text and stays as it came, while the fallback we write ourselves is
-        ' ours to translate — so it is a key, read when the dialog is built.
-        m.import.failures.Push({ id: resultId, error: resultError })
-    end if
-    PumpImport()
-end sub
-
-' All manifest fetches are done. Apply the settings through the same path the
-' Settings screen uses (invalid values are rejected, not stored), then report
-' the outcome in one dialog — the channel is the authority on the result; ECP
-' only ever said "delivered".
-sub FinishImport()
-    if m.import = invalid then return
-
-
+' ImportCoordinator's finished summary. MainScene owns the cross-screen effects:
+' apply the optional server setting, show the localized result dialog, and let
+' Home/player re-derive data that may have changed while the import ran.
+sub ImportFinished(summary as object)
+    if summary = invalid then return
     lines = []
     bullets = []
 
-    if m.import.requested > 0
-        if m.import.failed = 0
-            if m.import.added = 0
+    if summary.requested > 0
+        if summary.failed = 0
+            if summary.added = 0
                 lines.Push({ key: "importAlreadyInstalled" })
             else
-                lines.Push(ImportAddedLine(m.import.added))
+                lines.Push(ImportAddedLine(summary.added))
             end if
         else
             ' What landed and what did not are two lines, not one: "3 add-ons
             ' added, 2 failed." is a sentence that has to be re-ordered (and
             ' re-inflected) in every language, while two lines are two lines
             ' everywhere.
-            addedLine = ImportAddedLine(m.import.added)
+            addedLine = ImportAddedLine(summary.added)
             if addedLine <> invalid then lines.Push(addedLine)
-            if m.import.failed = 1
+            if summary.failed = 1
                 lines.Push({ key: "importFailedOne" })
             else
-                lines.Push({ key: "importFailedMany", values: { count: m.import.failed.ToStr() } })
+                lines.Push({ key: "importFailedMany", values: { count: summary.failed.ToStr() } })
             end if
-            for each failure in m.import.failures
+            for each failure in summary.failures
                 bullets.Push(failure)
             end for
         end if
     end if
 
-    if m.import.settings <> invalid and m.import.settings.serverAddress <> invalid
+    if summary.settings <> invalid and summary.settings.serverAddress <> invalid
         if m.storeHost <> invalid
-            ' This is the ECP entry point for the streaming server, and it used
-            ' to set the address and stop there. The value was live for the rest
-            ' of the session and gone on the next launch, because nothing had
-            ' ever written it to the registry — a wipe with no symptom until the
-            ' relaunch, and no line anywhere saying the value was never saved.
-            ' The store saves itself now, so the only thing left to do here is
-            ' notice when it could not.
-            if m.storeHost.callFunc("SettingsSetServerAddress", m.import.settings.serverAddress)
+            if m.storeHost.callFunc("SettingsSetServerAddress", summary.settings.serverAddress)
                 if m.storeHost.callFunc("SettingsSaveFailed") then
                     lines.Push({ key: "importServerLinkedNotSaved" })
                     ReportStoreFault("settings could not be saved", true)
@@ -1189,27 +1094,15 @@ sub FinishImport()
     end if
 
     if lines.Count() = 0 then lines.Push({ key: "importNoChanges" })
-
     ShowImportDialog("importTitle", lines, bullets)
 
-    ' New add-ons may have landed: Home's grid was built from the pre-import
-    ' catalog set, so let it re-derive if its add-on set actually moved. Same
-    ' predicate as the add-on sync, for the same reason — "the import added
-    ' something" is not the question, "is Home's grid current" is, and an import
-    ' that only re-registers what is already there still leaves Home showing
-    ' whatever it walked before. The fill happens off the UI thread behind the
-    ' summary dialog; nothing to block on here.
+    ' The import may have changed catalog providers or subtitle providers. These
+    ' calls are unconditional: the screens compare their actual provider set and
+    ' only rebuild if it moved, so an unchanged/re-registered add-on is harmless.
     if m.homeScreen <> invalid then m.homeScreen.callFunc("EnsureCurrentRows")
     if m.playerScreen <> invalid then m.playerScreen.callFunc("EnsureSubtitleProviders")
-
-    m.import = invalid
 end sub
 
-' The "N add-ons added" line — or invalid when nothing was added, because
-' zero has no line of its own (the summary says "Add-ons already installed."
-' instead). One and many are different words in every language — the noun and
-' the verb have to agree — so the table holds both forms and the code only
-' picks between them.
 function ImportAddedLine(count as integer) as object
     if count = 0 then return invalid
     if count = 1 then return { key: "importAddedOne" }

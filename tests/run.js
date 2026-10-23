@@ -2714,13 +2714,10 @@ function checkHomeCatalogStalenessContract() {
             err('MainScene.brs onAddonSyncResult() re-gates the rebuild on `added > 0` — an unchanged account installs nothing, so this is false on every run after the first and Home is never told to re-derive. That is the original bug.');
         }
     }
-    const importSub = body(main, 'FinishImport');
+    const importSub = body(main, 'ImportFinished');
     if (importSub) {
         if (!/callFunc\(\s*"EnsureCurrentRows"\s*\)/.test(importSub)) {
-            err('MainScene.brs FinishImport() no longer calls EnsureCurrentRows() — an import that re-registers add-ons Home already has still leaves Home showing its pre-import catalog set');
-        }
-        if (/if\s+m\.import\.added\s*>/.test(importSub)) {
-            err('MainScene.brs FinishImport() re-gates the rebuild on `m.import.added > 0` — same defect as the sync path: re-registering what is already installed adds nothing and leaves Home permanently stale');
+            err('MainScene.brs ImportFinished() no longer calls EnsureCurrentRows() — an import that re-registers add-ons Home already has still leaves Home showing its pre-import catalog set');
         }
     }
 
@@ -2976,13 +2973,12 @@ function checkAddonsWriteTaskContract() {
         console.error('MainScene must delegate collection puts to AddonWriteCoordinator, which must pump one AddonsWriteTask at a time — two collection sets in flight write each other stale');
         ok = false;
     }
-    // Every install/remove change must land on the account exactly once, so
-    // the gateway is the only way in — and the import pipeline (deep link,
-    // setup page, companion) reports through it too: a register there that
-    // stays local would be pruned by the next launch sync for nothing.
-    const importRegion = mainScene.match(/sub onImportTaskResult\b[\s\S]*?\nend sub/);
-    if (!/sub AccountAddonInstalled\(/.test(mainScene) || !importRegion || !/AccountAddonInstalled\(/.test(importRegion[0])) {
-        console.error('MainScene.brs must define sub AccountAddonInstalled and report every imported install through it in onImportTaskResult — two local install flows, one account gateway, or the import installs get pruned by the next sync');
+    // Every import route lands on the same Scene gateway as AddonsScreen, so
+    // a registered import reaches the account mirror before the next pull.
+    const importer = fs.readFileSync(path.join(projectRoot, 'components', 'ImportCoordinator.brs'), 'utf8');
+    const importMain = mainScene.match(/function ImportRegisterAddon\([^)]*\)[\s\S]*?\nend function/);
+    if (!/sub AccountAddonInstalled\(/.test(mainScene) || !/m\.scene\.callFunc\("ImportRegisterAddon"/.test(importer) || !importMain || !/AccountAddonInstalled\(/.test(importMain[0])) {
+        console.error('ImportCoordinator must report successful registrations through MainScene.ImportRegisterAddon and its one AccountAddonInstalled gateway — otherwise a local import is pruned by the next account sync');
         ok = false;
     }
     if (!/AddonsAccountStamp"\)\s*<>\s*m\.writeStamp/.test(writer)) {
@@ -3708,8 +3704,23 @@ function checkSetupServerContract() {
     if (!new RegExp(`sub ShowSetupAddress\\s*\\(`).test(sceneBrs) || !new RegExp(`function ImportFromSetup\\s*\\(`).test(sceneBrs)) {
         err('MainScene.brs must define ShowSetupAddress() and ImportFromSetup() — main() and the setup page call them');
     }
-    if (!new RegExp(`ImportFromSetup\\s*\\([^)]*\\)\\s*[\\s\\S]*\\nend function`).test(sceneBrs) || !/BeginImport\s*\(/.test(sceneBrs)) {
-        err('MainScene.brs ImportFromSetup no longer routes through BeginImport — the deep-link and setup-page paths must share the single import slot');
+    const importCoordinatorBrs = fs.readFileSync(path.join(projectRoot, 'components', 'ImportCoordinator.brs'), 'utf8');
+    const importCoordinatorXml = fs.readFileSync(path.join(projectRoot, 'components', 'ImportCoordinator.xml'), 'utf8');
+    if (!new RegExp(`ImportFromSetup\\s*\\([^)]*\\)\\s*[\\s\\S]*\\nend function`).test(sceneBrs) || !/callFunc\("StartImport"/.test(sceneBrs) || !/callFunc\("StartImport"/.test(sceneBrs.match(/sub HandleDeepLink[\s\S]*?\nend sub/)?.[0] || '')) {
+        err('MainScene must route both setup-page and deep-link imports through ImportCoordinator.StartImport — they share one busy slot');
+    }
+    for (const fn of ['SetScene', 'IsBusy', 'StartImport']) {
+        if (!new RegExp(`<function\\s+name="${fn}"\\s*\\/>`).test(importCoordinatorXml) || !new RegExp(`(?:sub|function) ${fn}\\(`).test(importCoordinatorBrs)) {
+            err(`ImportCoordinator must define and declare ${fn} for its component boundary`);
+        }
+    }
+    for (const fn of ['ImportRegisterAddon', 'ImportFinished']) {
+        if (!declaredScene.has(fn) || !new RegExp(`(?:sub|function) ${fn}\\(`).test(sceneBrs)) {
+            err(`MainScene must define and declare ${fn}, the ImportCoordinator callback interface`);
+        }
+    }
+    if (!/AsyncTask_Launch\(m\.top,\s*"AddonsInstallTask",\s*"onInstallResult"/.test(importCoordinatorBrs) || !/m\.scene\.callFunc\("ImportFinished",\s*summary\)/.test(importCoordinatorBrs)) {
+        err('ImportCoordinator must own the sequential install task and return its plain summary to MainScene');
     }
 
     const declaredAddons = new Set(

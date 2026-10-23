@@ -20,6 +20,10 @@
              import is already running so the page can answer 409. Shares the
              single import slot with HandleDeepLink via BeginImport. -->
         <function name="ImportFromSetup" />
+        <!-- ImportCoordinator returns successful install records through the
+             same account gateway as AddonsScreen and hands its summary here. -->
+        <function name="ImportRegisterAddon" />
+        <function name="ImportFinished" />
         <!-- A screen whose store bind came up short reports the failing hop
              here (Screen.brs's SetStores) and the Scene paints it, so a broken
              store layer can never be mistaken for an empty catalog. -->
@@ -84,6 +88,10 @@
 
         <!-- Single-flight whole-account collection replacement. -->
         <AddonWriteCoordinator id="addonWriteCoordinator" />
+
+        <!-- Shared sequential install pipeline for deep links and the setup
+             page; MainScene owns the resulting dialogs and screen refreshes. -->
+        <ImportCoordinator id="importCoordinator" />
 
         <!-- The serialized account-library write path owns its pending slots,
              one-shot player deferral timer, and LibraryPutTask lifecycle. -->
