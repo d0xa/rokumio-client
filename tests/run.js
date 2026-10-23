@@ -2970,8 +2970,10 @@ function checkAddonsWriteTaskContract() {
         ok = false;
     }
     const mainScene = fs.readFileSync(path.join(projectRoot, 'components', 'MainScene.brs'), 'utf8');
-    if (!/sub PumpAddonWrites\(\)/.test(mainScene) || !/m\.pushingAddonWrite then return/.test(mainScene)) {
-        console.error('MainScene.brs must pump one AddonsWriteTask at a time (PumpAddonWrites + the pushingAddonWrite guard) — two collection sets in flight write each other stale');
+    const mainXml = fs.readFileSync(path.join(projectRoot, 'components', 'MainScene.xml'), 'utf8');
+    const writer = fs.readFileSync(path.join(projectRoot, 'components', 'AddonWriteCoordinator.brs'), 'utf8');
+    if (!/sub PumpAddonWrites\(\)/.test(mainScene) || !/callFunc\("Pump"\)/.test(mainScene) || !/sub Pump\(\)/.test(writer) || !/if m\.pushing then return/.test(writer)) {
+        console.error('MainScene must delegate collection puts to AddonWriteCoordinator, which must pump one AddonsWriteTask at a time — two collection sets in flight write each other stale');
         ok = false;
     }
     // Every install/remove change must land on the account exactly once, so
@@ -2983,9 +2985,15 @@ function checkAddonsWriteTaskContract() {
         console.error('MainScene.brs must define sub AccountAddonInstalled and report every imported install through it in onImportTaskResult — two local install flows, one account gateway, or the import installs get pruned by the next sync');
         ok = false;
     }
-    if (!/AddonsAccountStamp"\)\s*<>\s*m\.addonWriteStamp/.test(mainScene)) {
-        console.error('MainScene.brs must re-pump when AddonsAccountStamp() no longer matches the stamp it launched with — a mirror change during a set is written by a follow-up set, not by luck');
+    if (!/AddonsAccountStamp"\)\s*<>\s*m\.writeStamp/.test(writer)) {
+        console.error('AddonWriteCoordinator must re-pump when AddonsAccountStamp() no longer matches the stamp it launched with — a mirror change during a set is written by a follow-up set, not by luck');
         ok = false;
+    }
+    for (const callback of ['ReportAddonWriteFault', 'HandleRevokedSession']) {
+        if (!new RegExp(`<function\\s+name="${callback}"\\s*\\/>`).test(mainXml) || !new RegExp(`(?:sub|function) ${callback}\\(`).test(mainScene) || !new RegExp(`callFunc\\("${callback}"`).test(writer)) {
+            console.error(`AddonWriteCoordinator/MainScene callback ${callback} must be defined, declared on MainScene, and called through that interface`);
+            ok = false;
+        }
     }
     if (!/result\.raw/.test(mainScene)) {
         console.error('MainScene.brs must adopt the pull result.raw as the mirror — filtered descriptors would rewrite the account and delete un-importable add-ons on the next set');

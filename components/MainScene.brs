@@ -72,14 +72,8 @@ sub init()
     m.uiRoot = m.top.FindNode("uiRoot")
     m.faultStrip = m.top.FindNode("faultStrip")
     m.libraryWriteCoordinator = m.top.FindNode("libraryWriteCoordinator")
+    m.addonWriteCoordinator = m.top.FindNode("addonWriteCoordinator")
     m.top.FindNode("background").color = Theme().screenBg
-
-    ' Same contract for the addon-collection pump: one flight at a time, and
-    ' the flag exists precisely so an unassigned read can never happen on the
-    ' render thread (see the essay above — the suite cannot catch this).
-    m.pushingAddonWrite = false
-    m.addonWriteTask = invalid
-    m.addonWriteStamp = 0
 
     ' Settings can start the link-code flow; logout reuses the pairing worker.
     ' Both flags are session-flow state with no store counterpart.
@@ -148,6 +142,7 @@ sub init()
     m.storeHost = CreateObject("roSGNode", "StoreHost")
     m.top.AppendChild(m.storeHost)
     m.libraryWriteCoordinator.callFunc("SetStoreHost", m.storeHost)
+    m.addonWriteCoordinator.callFunc("SetDependencies", m.storeHost, m.top)
 
     ' The keys the last add-on sync published into the strip. Held so a later
     ' sync can retract exactly what it published: the reason strings carry the
@@ -273,34 +268,11 @@ sub onWatchedChange()
     if change <> invalid then m.libraryWriteCoordinator.callFunc("OnWatchedChange", change)
 end sub
 
-' ---- the account add-on collection write-back pump --------------------------
-'
-' The put REPLACES the account's whole add-on collection, so exactly like the
-' library pump there is one worker and one flight at a time. There is no queue
-' though — there cannot be, the payload of every put is everything — so a
-' change that lands while a put is in flight merely re-mutates the store's
-' mirror and bumps its stamp; when the flight settles, a stamp that no longer
-' matches means the mirror moved during the flight and one more put carries
-' the newest collection. Three puts can never clobber each other because only
-' one can be in the air at all.
+' ---- the account add-on collection write-back -------------------------------
+' The mirror mutation is the Scene's gateway; the writer owns the serialized
+' whole-collection PUT and its task lifecycle.
 sub PumpAddonWrites()
-    if m.pushingAddonWrite then return
-    if m.storeHost = invalid then return
-    if m.storeHost.callFunc("AuthGetSession") <> "stremio" then return
-    addons = m.storeHost.callFunc("AddonsAccountPutAddons")
-    if addons = invalid
-        ' The store has no mirror to write from (launch sync failed, guest
-        ' session, fresh login mid-flight): refuse to author a throwaway
-        ' collection, which would DELETE un-importable account add-ons.
-        return
-    end if
-    m.addonWriteStamp = m.storeHost.callFunc("AddonsAccountStamp")
-    task = AsyncTask_Launch(m.top, "AddonsWriteTask", "onAddonWriteResult", {
-        authKey: m.storeHost.callFunc("AuthGetAuthKey")
-        payload: { addons: addons }
-    }, "addonWriteTask")
-    m.addonWriteTask = task
-    m.pushingAddonWrite = true
+    if m.addonWriteCoordinator <> invalid then m.addonWriteCoordinator.callFunc("Pump")
 end sub
 
 ' THE one gateway every local add-on change flows through, whichever flow
@@ -361,32 +333,10 @@ sub AddonMirrorFault(outcome as object, what as string)
     end if
 end sub
 
-' The collection put landed. Reap, clear the flight, and let a mirror that
-' moved during it (another install/remove on the same screen) trigger the
-' follow-up put.
-sub onAddonWriteResult()
-    task = m.addonWriteTask
-    if task = invalid then return
-    result = task.result
-    if result = invalid then return
-    m.addonWriteTask = invalid
-    m.pushingAddonWrite = false
-    AsyncTask_Reap(task, m.top, false)
-
-    if result.revokedSession = true
-        HandleRevokedSession()
-        return
-    end if
-    if not result.ok
-        reason = "unknown error"
-        if result.error <> invalid and result.error <> "" then reason = result.error
-        AddAddonSyncFault("addon change failed: " + reason)
-        return
-    end if
-    print "[addons] collection put landed"
-    if m.storeHost <> invalid and m.storeHost.callFunc("AddonsAccountStamp") <> m.addonWriteStamp
-        PumpAddonWrites()
-    end if
+' AddonWriteCoordinator reports failed puts here so MainScene remains the
+' authority for the transient sync-fault lease and its retraction list.
+sub ReportAddonWriteFault(reason as string)
+    AddAddonSyncFault(reason)
 end sub
 
 ' The exit confirm. A StandardMessageDialog, built when it is shown: the same

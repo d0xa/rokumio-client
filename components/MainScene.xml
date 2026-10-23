@@ -24,6 +24,8 @@
              here (Screen.brs's SetStores) and the Scene paints it, so a broken
              store layer can never be mistaken for an empty catalog. -->
         <function name="ReportStoreFault" />
+        <function name="ReportAddonWriteFault" />
+        <function name="HandleRevokedSession" />
     </interface>
 
     <!-- Core + stores are declared here and inherited by the whole subtree, so
@@ -79,6 +81,9 @@
              its display nodes, state and dismissal timer; MainScene forwards
              the reporting interface screens already use. -->
         <FaultStrip id="faultStrip" />
+
+        <!-- Single-flight whole-account collection replacement. -->
+        <AddonWriteCoordinator id="addonWriteCoordinator" />
 
         <!-- The serialized account-library write path owns its pending slots,
              one-shot player deferral timer, and LibraryPutTask lifecycle. -->
