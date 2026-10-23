@@ -2549,6 +2549,35 @@ function checkTaskTeardownContract() {
     return ok;
 }
 
+// HomeCatalogsTask used to publish { rows: allRowsSoFar } after every catalog.
+// Each field assignment crossed the Task boundary with every previous catalog
+// and its meta array again, so the payload-copy volume grew quadratically as the
+// Home filled. The task now sends one row per result and a small completion
+// packet; the screen applies each row as it arrives.
+function checkHomeCatalogResultsAreIncremental() {
+    const fs = require('fs');
+    const read = (f) => fs.readFileSync(path.join(projectRoot, f), 'utf8');
+    let ok = true;
+    const err = (m) => { console.error(m); ok = false; };
+    const task = read('components/HomeCatalogsTask.brs');
+    const screen = read('components/HomeScreen.brs');
+    const onResult = screen.match(/^sub onCatalogState\([^\n]*\)[\s\S]*?^end sub/m);
+
+    if (!/m\.top\.result\s*=\s*\{\s*row:\s*row,\s*done:\s*false\s*\}/.test(task)) {
+        err('HomeCatalogsTask must publish one completed row per result, not a snapshot containing every row so far');
+    }
+    if (/m\.top\.result\s*=\s*\{\s*rows\s*:/.test(task) || /rows\.Push\(/.test(task)) {
+        err('HomeCatalogsTask still accumulates/publishes the full catalog row list — that recopies every earlier meta on each result');
+    }
+    if (!/m\.top\.result\s*=\s*\{\s*done:\s*true/.test(task)) {
+        err('HomeCatalogsTask must publish a final completion packet after the last row');
+    }
+    if (!onResult || !/state\.row/.test(onResult[0]) || !/ApplyCatalogRow\(state\.row\)/.test(onResult[0]) || !/state\.done\s*=\s*true/.test(onResult[0])) {
+        err('HomeScreen.onCatalogState must consume each row result and finish on the completion packet');
+    }
+    return ok;
+}
+
 function checkStopSignalContract() {
     const fs = require('fs');
     const read = (f) => fs.readFileSync(path.join(projectRoot, f), 'utf8');
@@ -5813,7 +5842,7 @@ async function main() {
     // callFunc only invokes functions declared in a component's interface, and
     // the suite mocks callFunc, so a missing declaration would pass tests but
     // silently no-op on device. Guard the contract here.
-    if (!checkDeferredVideoPlayContract() || !checkScreenRuntimeHazards() || !checkScreenContract() || !checkScreensHidden() || !checkTileContract() || !checkPosterStatusContract() || !checkPosterFallbackContract() || !checkNoDuplicateScripts() || !checkStoreHandoffContract() || !checkLibraryCodecContract() || !checkMainSceneContract() || !checkSessionAuthorityContract() || !checkStremioProvisioningContract() || !checkAddonOrderingContract() || !checkAddonSyncTaskContract() || !checkStreamResolveTaskContract() || !checkEngineWarmupContract() || !checkTransportRetryContract() || !checkStaggeredSyncContract() || !checkNetDiagContract() || !checkDeviceCapContract() || !checkCodecPlaybackContract() || !checkHomeCatalogStalenessContract() || !checkTaskTeardownContract() || !checkStopSignalContract() || !checkSubtitleMergeContract() || !checkWatchStatePushContract() || !checkHomeScreenContract() || !checkFilterBarContract() || !checkLibraryScreenContract() || !checkLibraryPutTaskContract() || !checkAddonsWriteTaskContract() || !checkLogoutTaskContract() || !checkSettingsPushContract() || !checkSettingsSectionsContract() || !checkTorrentProfileContract() || !checkCacheSizeContract() || !checkThemeContract() || !checkPosterScalingContract() || !checkPosterLoadSizePolicy() || !checkCompanionQrContract() || !checkSetupServerContract() || !checkDetailsMetaTypeContract() || !checkStreamFormatQueryContract() || !checkChannelCwPolicyContract() || !checkStreamTypeGateContract() || !checkDiscoverSourcesContract() || !checkMultiAddonSearchContract() || !checkStringMethodContract() || !checkMetaFieldCoercionContract() || !checkStringOfContract() || !checkI18nContract() || !checkNoUntranslatedLiterals() || !checkEpisodeSeriesBatchContract() || !checkStoreAddonValueContract() || !checkAddonJsonContract() || !checkSubtitlePlayGateContract() || !checkPreVideoIndicatorContract() || !checkPreVideoWaitLabelContract() || !checkNativeBufferingSuppressionContract()) {
+    if (!checkDeferredVideoPlayContract() || !checkScreenRuntimeHazards() || !checkScreenContract() || !checkScreensHidden() || !checkTileContract() || !checkPosterStatusContract() || !checkPosterFallbackContract() || !checkNoDuplicateScripts() || !checkStoreHandoffContract() || !checkLibraryCodecContract() || !checkMainSceneContract() || !checkSessionAuthorityContract() || !checkStremioProvisioningContract() || !checkAddonOrderingContract() || !checkAddonSyncTaskContract() || !checkStreamResolveTaskContract() || !checkEngineWarmupContract() || !checkTransportRetryContract() || !checkStaggeredSyncContract() || !checkNetDiagContract() || !checkDeviceCapContract() || !checkCodecPlaybackContract() || !checkHomeCatalogStalenessContract() || !checkTaskTeardownContract() || !checkHomeCatalogResultsAreIncremental() || !checkStopSignalContract() || !checkSubtitleMergeContract() || !checkWatchStatePushContract() || !checkHomeScreenContract() || !checkFilterBarContract() || !checkLibraryScreenContract() || !checkLibraryPutTaskContract() || !checkAddonsWriteTaskContract() || !checkLogoutTaskContract() || !checkSettingsPushContract() || !checkSettingsSectionsContract() || !checkTorrentProfileContract() || !checkCacheSizeContract() || !checkThemeContract() || !checkPosterScalingContract() || !checkPosterLoadSizePolicy() || !checkCompanionQrContract() || !checkSetupServerContract() || !checkDetailsMetaTypeContract() || !checkStreamFormatQueryContract() || !checkChannelCwPolicyContract() || !checkStreamTypeGateContract() || !checkDiscoverSourcesContract() || !checkMultiAddonSearchContract() || !checkStringMethodContract() || !checkMetaFieldCoercionContract() || !checkStringOfContract() || !checkI18nContract() || !checkNoUntranslatedLiterals() || !checkEpisodeSeriesBatchContract() || !checkStoreAddonValueContract() || !checkAddonJsonContract() || !checkSubtitlePlayGateContract() || !checkPreVideoIndicatorContract() || !checkPreVideoWaitLabelContract() || !checkNativeBufferingSuppressionContract()) {
         process.exit(1);
     }
 
