@@ -24,6 +24,12 @@
              same account gateway as AddonsScreen and hands its summary here. -->
         <function name="ImportRegisterAddon" />
         <function name="ImportFinished" />
+        <!-- AccountSyncCoordinator returns fetched data here; MainScene keeps
+             screen adoption and session navigation at the Scene boundary. -->
+        <function name="AdoptAddonSyncResult" />
+        <function name="ApplyLibrarySyncResult" />
+        <function name="ClearAddonSyncFaults" />
+        <function name="ReportAddonSyncFault" />
         <!-- A screen whose store bind came up short reports the failing hop
              here (Screen.brs's SetStores) and the Scene paints it, so a broken
              store layer can never be mistaken for an empty catalog. -->
@@ -92,6 +98,9 @@
         <!-- Shared sequential install pipeline for deep links and the setup
              page; MainScene owns the resulting dialogs and screen refreshes. -->
         <ImportCoordinator id="importCoordinator" />
+
+        <!-- Serializes launch-time account pulls and owns both Task lifecycles. -->
+        <AccountSyncCoordinator id="accountSyncCoordinator" />
 
         <!-- The serialized account-library write path owns its pending slots,
              one-shot player deferral timer, and LibraryPutTask lifecycle. -->

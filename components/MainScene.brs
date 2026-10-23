@@ -1,11 +1,9 @@
-' Thin orchestrator.
+' MainScene — the root Scene and integration boundary.
 '
-' MainScene owns exactly three things and nothing else:
-'   1. the ScreenStack,
-'   2. Back routing (top screen first; the stack pops when it declines),
-'   3. store instantiation and action dispatch.
-'
-' Zero business logic lives here. Everything else is in a screen or a store.
+' It owns the ScreenStack, screen routing, the StoreHost node, and cross-screen
+' effects that need Scene authority (session transitions, dialogs, refreshes).
+' Stateful asynchronous workflows live in focused coordinator components; this
+' Scene forwards their inputs/results and keeps the navigation-level decisions.
 sub init()
     m.stack = ScreenStack(m.top)
     m.top.palette = AppPalette()
@@ -74,6 +72,7 @@ sub init()
     m.libraryWriteCoordinator = m.top.FindNode("libraryWriteCoordinator")
     m.addonWriteCoordinator = m.top.FindNode("addonWriteCoordinator")
     m.importCoordinator = m.top.FindNode("importCoordinator")
+    m.accountSyncCoordinator = m.top.FindNode("accountSyncCoordinator")
     m.top.FindNode("background").color = Theme().screenBg
 
     ' Settings can start the link-code flow; logout reuses the pairing worker.
@@ -81,11 +80,6 @@ sub init()
     m.loginFromSettings = false
     m.logoutTask = invalid
     m.pendingLogout = false
-    ' A library sync asked for while the add-on sync is still running is deferred
-    ' to that sync's completion: both are launched together at startup and the
-    ' device refuses too many NEW concurrent connections. See StartLibrarySync.
-    ' Initialized here for the same &h18 reason as the flags above.
-    m.pendingLibrarySync = false
     ' A revoked-account bounce fires at most once per login: both launch-time
     ' pulls (library + addon) fail together on a dead authKey, and only the
     ' first one tears the session down.
@@ -145,6 +139,7 @@ sub init()
     m.libraryWriteCoordinator.callFunc("SetStoreHost", m.storeHost)
     m.addonWriteCoordinator.callFunc("SetDependencies", m.storeHost, m.top)
     m.importCoordinator.callFunc("SetScene", m.top)
+    m.accountSyncCoordinator.callFunc("SetDependencies", m.storeHost, m.top)
 
     ' The keys the last add-on sync published into the strip. Held so a later
     ' sync can retract exactly what it published: the reason strings carry the
@@ -667,9 +662,7 @@ end sub
 sub HandleRevokedSession()
     if m.revokedSessionHandled then return
     m.revokedSessionHandled = true
-    ' The session is being torn down; a launch-time library sync deferred behind
-    ' the add-on sync has nothing left to pull.
-    m.pendingLibrarySync = false
+    if m.accountSyncCoordinator <> invalid then m.accountSyncCoordinator.callFunc("CancelPendingLibrarySync")
     ResetToAuthGate()
     ShowSessionRevokedDialog()
 end sub
@@ -712,75 +705,22 @@ sub onLogoutResult()
     AsyncTask_Reap(task, m.top, false)
 end sub
 
-' Kick the account addon sync for a stremio session. The API answers with the
-' full collection incl. each manifest, so no per-addon fetches follow — the task
-' returns the descriptors and MainScene adopts them through AddonsStore (the
-' single writer for installed records). Created per sync like the pairing task.
-'
-' Runs at BOTH login and relaunch. It used to run only at login, on the strength
-' of "a relaunched stremio session skips this (its addons are already in the
-' stremio_addons registry key from the login that synced them)" — a claim about
-' persisted state that nothing checked and that a single failed login-time sync
-' made permanently false. The consequence was severe and silent: AddonsStore
-' deliberately shows no built-in seeds for a stremio session, so an empty
-' stremio_addons meant no Cinemeta, which meant every AddonsGet("com.linvo.
-' cinemeta") caller got invalid — including MetaAddress(), so the Continue
-' Watching row's Details fetch went out with an empty addon address and rendered
-' a title with no poster and no description. The only recovery was to log out
-' and re-pair the account. One idempotent GET is now the recovery.
+' Start the account pull. The coordinator owns its Task and serializes it with
+' the library pull; the Scene adopts the returned descriptors below. Called at
+' both relaunch and login so a failed earlier pull can recover without re-pairing.
 sub StartAddonSync()
-    fields = {}
-    if m.storeHost <> invalid then fields.authKey = m.storeHost.callFunc("AuthGetAuthKey")
-    task = AsyncTask_Launch(m.top, "AddonSyncTask", "onAddonSyncResult", fields, "addonSyncTask", "onAddonSyncFinished")
-    m.addonSyncTask = task
+    if m.accountSyncCoordinator <> invalid then m.accountSyncCoordinator.callFunc("StartAddonSync")
 end sub
 
-' One sync settled. Register every descriptor through AddonsStore (duplicates
-' are skipped, so re-syncing is idempotent) and rebuild Home's rows from the
-' new catalog set. Partial failures are non-fatal — whatever synced registers
-' and the session proceeds.
-'
-' Every outcome names itself in the fault strip, carrying the transport's own
-' error text where there is one, so the next occurrence is a diagnosis instead of
-' an inference.
-'
-' An empty result is NOT one of those outcomes, and treating it as one is what
-' broke first login. `result` is alwaysNotify with no value, so it can notify
-' before the worker has written anything, and the handler cannot tell "not yet"
-' from "the worker produced nothing" by looking at result alone. This sub used to
-' call AsyncTask_Reap on an empty result — which unobserves the field and removes
-' the node — and CleanupStremioPairTask's own header records that removing a
-' running Task does NOT kill its worker thread. So the real result landed on a
-' node nobody was watching, the account's add-ons were silently dropped, `added`
-' stayed 0, RebuildRows never ran, and Home went on rendering the pre-login rows
-' as though nothing had happened. The app looked healthy and was not.
-'
-' So an empty result is declined here and the node is left alone. The authority
-' on whether the worker really finished without one is onAddonSyncFinished, which
-' can only fire once the task's sentinel says the worker is done.
-sub onAddonSyncResult()
-    task = m.addonSyncTask
-    if task = invalid then return
-    result = task.result
+' Adopt the result produced by AccountSyncCoordinator. The coordinator owns the
+' task and ordering; the Scene owns store adoption's cross-screen effects and
+' the fault strip.
+sub AdoptAddonSyncResult(result as object)
     if result = invalid then return
-
-    m.addonSyncTask = invalid
-    AsyncTask_Reap(task, m.top, false)
-
-    ClearAddonSyncFaults()
-
-    ' Compared, not truthiness-tested: a result packet without the key reads
-    ' back invalid, and `if invalid` is a hard &h18 crash on device.
-    if result.revokedSession = true
-        HandleRevokedSession()
-        return
-    end if
-
     if not result.ok
         reason = "unknown error"
         if result.error <> invalid and result.error <> "" then reason = result.error
         AddAddonSyncFault("addon sync failed: " + reason)
-        PumpPendingLibrarySync()
         return
     end if
 
@@ -800,15 +740,10 @@ sub onAddonSyncResult()
                 end if
             end if
         end for
-        ' A successful pull is the sync's word for the whole account state, so
-        ' the collection mirror is adopted and the pull half of two-way sync
-        ' runs (see PruneAddonsOutOfAccount): an installed record the account
-        ' never mentions was removed elsewhere and is removed here. The fault
-        ' path above also carries a descriptors array (an empty one), so this
-        ' is gated on ok, not on the array — pruning against a failed pull
-        ' would erase every non-built-in install for nothing.
+        ' Adopt the raw account collection, then prune local non-built-ins the
+        ' successful pull says were removed elsewhere. Never prune on failure.
         pruned = 0
-        if result.ok and m.storeHost <> invalid
+        if m.storeHost <> invalid
             m.storeHost.callFunc("AddonsSyncAccountCollection", result.raw)
             keepIds = []
             for each descriptor in result.descriptors
@@ -819,87 +754,18 @@ sub onAddonSyncResult()
         if pruned > 0 then print "[addons] sync pruned " ; pruned.ToStr() ; " add-on(s) absent from the account"
     end if
     print "[addons] sync landed — registered " ; added ; ", already had " ; skipped ; ", rejected " ; failed
-    ' Unconditional, and the condition is deliberately NOT "did this sync install
-    ' anything new". A re-sync of an unchanged account installs nothing, so that
-    ' predicate was false on every run after the first and Home kept the catalog
-    ' set it walked at launch — which, in a stremio session, is usually just the
-    ' built-in seeds. Home compares the add-on set itself and rebuilds only if it
-    ' moved, so the common case costs one in-memory set comparison and no catalog
-    ' walk. See HomeScreen.EnsureCurrentRows.
+    ' Unconditional: an unchanged account still tells Home to compare its
+    ' catalog signature, and the common case is one in-memory check.
     if m.homeScreen <> invalid then m.homeScreen.callFunc("EnsureCurrentRows")
-    ' The player snapshotted its subtitle providers when it was entered, which on
-    ' a cold launch is before this loop has run. Same predicate, same reason: tell
-    ' whichever player is up to re-derive, so an account add-on that is only now in
-    ' the registry is still asked for captions. Inert when no play is in progress —
-    ' the player's own m.subtitleParams guard makes it return.
     if m.playerScreen <> invalid then m.playerScreen.callFunc("EnsureSubtitleProviders")
     if failed > 0
         AddAddonSyncFault("addon sync: " + failed.ToStr() + " of " + result.descriptors.Count().ToStr() + " add-ons were rejected")
     end if
-    ' A sync that succeeded and still left the registry empty is the exact state
-    ' that used to require re-pairing. Name it, so a launch in that state is a
-    ' visible fault rather than a session that mysteriously has no catalogs.
     if m.storeHost <> invalid and m.storeHost.callFunc("AddonsGetAll").Count() = 0
         AddAddonSyncFault("addon sync: the account reported no add-ons")
     end if
-    ' The add-on sync is done, so a launch-time library sync that deferred behind
-    ' it can now run without opening a second connection alongside it.
-    PumpPendingLibrarySync()
 end sub
 
-' The worker's sentinel fired. The VALUE of the sentinel decides what that means,
-' and that distinction is the entire reason this sub exists.
-'
-' An alwaysNotify field notifies once at ObserveField time, carrying whatever the
-' field holds then — and field notifications are dispatched on the event loop, not
-' at the moment the observer is attached. So the first "finished" notification is
-' queued while AsyncTask_Launch is still on the stack (the slot is not even filled
-' yet, so that first one is harmless) and is DELIVERED afterwards, by which time
-' the worker is running. An alwaysNotify "result" field behaves the same way; the
-' difference is only that this handler and onAddonSyncResult disagree about how to
-' read it.
-'
-' Concretely, what this sub was doing wrong: it treated the arrival of a
-' "finished" notification as proof the worker was done, reaped the node and
-' reported a fault — while the worker was still blocked inside its HTTP call, on
-' its very first run, every single time. On device that read as
-'   addon sync: the worker finished with no result (stage: request-started)
-' with a stage taken from a task still in flight. Gating on the sentinel's value
-' instead of its arrival is the fix: the real notification carries true, the
-' spurious one carries false, and only the former may conclude anything.
-'
-' Once the value IS true, the worker has run sync() to completion, so an absent
-' result is a real fault and this is the only place that reports it. The stage it
-' stopped at is the diagnosis: "request-started" means the worker is genuinely
-' still in the request or was killed mid-request; "entered-sync" or "init" means
-' sync() effectively did not run; "threw" means the catch path ran but even its
-' error packet never landed. It is written into the fault text AND printed,
-' because the strip is what a fault found later is read from while the print is
-' what a fault being watched for is caught by.
-sub onAddonSyncFinished()
-    task = m.addonSyncTask
-    if task = invalid then return
-
-    ' The spurious alwaysNotify notification. The worker has not finished; its
-    ' real notification is still to come. Touch nothing — reaping here is what
-    ' destroyed the real result.
-    if task.finished <> true then return
-
-    m.addonSyncTask = invalid
-
-    stage = "unknown"
-    if task.stage <> invalid and task.stage <> "" then stage = task.stage
-    AsyncTask_Reap(task, m.top, false)
-
-    ClearAddonSyncFaults()
-    print "[addons] sync worker finished with NO result (stage: " ; stage ; ")"
-    AddAddonSyncFault("addon sync: the worker finished with no result (stage: " + stage + ")")
-    PumpPendingLibrarySync()
-end sub
-
-' Retract exactly the lines the last add-on sync published. Clearing by text
-' would not work: the reasons embed the transport's error string, so a retry
-' that failed differently would leave the previous line up forever.
 sub ClearAddonSyncFaults()
     if m.addonSyncFaults <> invalid
         for each key in m.addonSyncFaults
@@ -908,6 +774,10 @@ sub ClearAddonSyncFaults()
         end for
     end if
     m.addonSyncFaults = []
+end sub
+
+sub ReportAddonSyncFault(reason as string)
+    AddAddonSyncFault(reason)
 end sub
 
 sub AddAddonSyncFault(reason as string)
@@ -931,59 +801,16 @@ end sub
 ' so serializing the two account syncs keeps the launch burst under it. Whatever
 ' still slips through is caught by Transport's bounded retry.
 sub StartLibrarySync()
-    if m.addonSyncTask <> invalid
-        m.pendingLibrarySync = true
-        return
-    end if
-    LaunchLibrarySync()
+    if m.accountSyncCoordinator <> invalid then m.accountSyncCoordinator.callFunc("StartLibrarySync")
 end sub
 
-' The actual launch, split out so the deferred path can reuse it unchanged.
-sub LaunchLibrarySync()
-    fields = {}
-    if m.storeHost <> invalid then fields.authKey = m.storeHost.callFunc("AuthGetAuthKey")
-    task = AsyncTask_Launch(m.top, "LibrarySyncTask", "onLibrarySyncResult", fields, "librarySyncTask")
-    m.librarySyncTask = task
-end sub
-
-' Run the library sync that was deferred behind an in-flight add-on sync. Called
-' from every place the add-on sync node is torn down — except revocation, which
-' is dropping the session and has nothing to sync.
-sub PumpPendingLibrarySync()
-    if m.pendingLibrarySync <> true then return
-    m.pendingLibrarySync = false
-    LaunchLibrarySync()
-end sub
-
-' One library sync settled. Reconcile the store with the remote collection and
-' update Home's Continue Watching row in place — the persisted cache (if any)
-' keeps rendering until then. Failures are non-fatal: on a login the CW row
-' just stays empty, on a relaunch the persisted cache keeps rendering.
-sub onLibrarySyncResult()
-    task = m.librarySyncTask
-    m.librarySyncTask = invalid
-    if task = invalid then return
-    result = task.result
-    AsyncTask_Reap(task, m.top, false)
-
-    ' A dead account session (revoked/expired server-side) is authoritative:
-    ' drop to the guest gate instead of silently limping on a key that can no
-    ' longer sync.
-    if result <> invalid and result.revokedSession
-        HandleRevokedSession()
-        return
-    end if
-
-    if result = invalid or not result.ok or result.items = invalid
-        return
-    end if
+' Apply the library snapshot returned by AccountSyncCoordinator. The pull/task
+' lifecycle is elsewhere; this is the Scene-side store and screen adoption.
+sub ApplyLibrarySyncResult(result as object)
+    if result = invalid or not result.ok or result.items = invalid then return
     if m.storeHost = invalid then return
     m.storeHost.callFunc("LibrarySyncFromStremio", result.items)
     if m.homeScreen <> invalid then m.homeScreen.callFunc("RefreshContinueWatching")
-    ' The relaunched-session case can land the sync while the Library screen is
-    ' already up: poke its grid so the freshly synced saved set appears without
-    ' a re-entry (guest sessions never reach this path). Same idempotent rebuild
-    ' as the LibraryScreen's own OnEnter.
     if m.stack.top() <> invalid and m.stack.top().id = "libraryScreen" and m.libraryScreen <> invalid
         m.libraryScreen.callFunc("RefreshRows")
     end if

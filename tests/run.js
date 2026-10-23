@@ -1063,15 +1063,16 @@ function checkStremioProvisioningContract() {
     const fs = require('fs');
     const read = (f) => fs.readFileSync(path.join(projectRoot, f), 'utf8');
     const brs = read('components/MainScene.brs');
+    const syncCoordinator = read('components/AccountSyncCoordinator.brs');
     const screen = read('components/Screen.brs');
     const api = read('source/stores/StremioApiStore.bs');
     let ok = true;
 
     const subBody = (source, name) => {
-        const start = source.indexOf(`sub ${name}()`);
-        if (start === -1) return '';
-        const next = source.indexOf('\nsub ', start + 1);
-        return next === -1 ? source.slice(start) : source.slice(start, next);
+        const match = new RegExp(`^[ \\t]*sub ${name}\\s*\\(`, 'm').exec(source);
+        if (!match) return '';
+        const next = source.indexOf('\nsub ', match.index + 1);
+        return next === -1 ? source.slice(match.index) : source.slice(match.index, next);
     };
 
     // 1. A relaunched stremio session must re-pull the collection, not trust
@@ -1109,21 +1110,22 @@ function checkStremioProvisioningContract() {
     // 3. A sync that reports nothing must say so. A transport timeout, an HTTP
     //    error and an empty account all used to fall off the end of the sub
     //    identically, so Home kept rendering pre-login rows looking healthy.
-    const result = subBody(brs, 'onAddonSyncResult');
-    if (!/ClearAddonSyncFaults\(\)/.test(result)) {
-        console.error('MainScene.brs onAddonSyncResult does not retract its previous fault lines — a retry that failed differently would leave stale errors up forever');
+    const result = subBody(syncCoordinator, 'onAddonResult');
+    if (!/callFunc\("ClearAddonSyncFaults"\)/.test(result)) {
+        console.error('AccountSyncCoordinator.onAddonResult does not retract previous fault lines — a retry that failed differently would leave stale errors up forever');
         ok = false;
     }
-    if (!/if\s+not\s+result\.ok\s*\n[\s\S]{0,400}?AddAddonSyncFault\(/.test(result)) {
-        console.error('MainScene.brs onAddonSyncResult still falls off the end when the sync fails — an unreported failed sync is indistinguishable from a healthy one');
+    if (!/callFunc\("AdoptAddonSyncResult",\s*result\)/.test(result) || !/if\s+not\s+result\.ok\s*\n[\s\S]{0,400}?AddAddonSyncFault\(/.test(brs)) {
+        console.error('AccountSyncCoordinator must hand add-on results to MainScene, where failed syncs are reported');
         ok = false;
     }
-    if (!/result\.error/.test(result)) {
-        console.error('MainScene.brs onAddonSyncResult never reads result.error — the transport\'s own reason is discarded instead of shown');
+    const adopt = subBody(brs, 'AdoptAddonSyncResult');
+    if (!/result\.error/.test(adopt)) {
+        console.error('MainScene.AdoptAddonSyncResult must retain the transport error in its displayed fault');
         ok = false;
     }
-    if (!/AddAddonSyncFault\(\s*"addon sync: the account reported no add-ons"/.test(result)) {
-        console.error('MainScene.brs onAddonSyncResult must name the synced-but-empty outcome — that is the exact state that used to require re-pairing');
+    if (!/AddAddonSyncFault\(\s*"addon sync: the account reported no add-ons"/.test(brs)) {
+        console.error('MainScene.AdoptAddonSyncResult must name the synced-but-empty outcome — that is the exact state that used to require re-pairing');
         ok = false;
     }
 
@@ -1398,39 +1400,44 @@ function checkTransportRetryContract() {
 // ordering is pinned structurally.
 function checkStaggeredSyncContract() {
     const fs = require('fs');
-    const read = (f) => fs.readFileSync(path.join(projectRoot, f), 'utf8');
-    const brs = read('components/MainScene.brs');
+    const brs = fs.readFileSync(path.join(projectRoot, 'components', 'AccountSyncCoordinator.brs'), 'utf8');
+    const scene = fs.readFileSync(path.join(projectRoot, 'components', 'MainScene.brs'), 'utf8');
     let ok = true;
     const err = (m) => { console.error(m); ok = false; };
 
     const body = (name) => {
-        const start = new RegExp(`^[ \\t]*sub\\s+${name}\\s*\\(`, 'm').exec(brs);
+        const start = new RegExp(`^[ \\t]*(?:sub|function)\\s+${name}\\s*\\(`, 'm').exec(brs);
         if (!start) return null;
         const rest = brs.slice(start.index);
-        const end = rest.slice(1).search(/^[ \t]*end\s+sub\b/m);
+        const end = rest.slice(1).search(/^[ \\t]*end\\s+(?:sub|function)\\b/m);
         return end === -1 ? rest : rest.slice(0, end + 1);
     };
 
     const start = body('StartLibrarySync');
-    if (!start || !/m\.addonSyncTask\s*<>\s*invalid/.test(start) || !/m\.pendingLibrarySync\s*=\s*true/.test(start)) {
-        err('MainScene.brs StartLibrarySync no longer defers behind an in-flight add-on sync — both launch-time pulls would open connections at once, the concurrency that loses transfers');
+    if (!start || !/m\.addonTask\s*<>\s*invalid/.test(start) || !/m\.pendingLibrarySync\s*=\s*true/.test(start)) {
+        err('AccountSyncCoordinator.StartLibrarySync no longer defers behind an in-flight add-on sync — both launch-time pulls would open connections at once');
     }
     if (!/LaunchLibrarySync\(\)/.test(start || '')) {
-        err('MainScene.brs StartLibrarySync no longer launches the library sync when it is free to do so');
+        err('AccountSyncCoordinator.StartLibrarySync no longer launches the library sync when it is free to do so');
     }
     const pump = body('PumpPendingLibrarySync');
     if (!pump || !/m\.pendingLibrarySync\s*<>\s*true\s+then\s+return/.test(pump) || !/LaunchLibrarySync\(\)/.test(pump)) {
-        err('MainScene.brs PumpPendingLibrarySync must run only a deferred sync and launch it exactly once');
+        err('AccountSyncCoordinator.PumpPendingLibrarySync must run only a deferred sync and launch it exactly once');
     }
-    for (const name of ['onAddonSyncResult', 'onAddonSyncFinished']) {
+    for (const name of ['onAddonResult', 'onAddonFinished']) {
         const b = body(name);
         if (!b || !/PumpPendingLibrarySync\(\)/.test(b)) {
-            err(`MainScene.brs ${name} does not pump a deferred library sync — a launch that deferred it would never run it (a silent no-library-sync)`);
+            err(`AccountSyncCoordinator.${name} does not pump a deferred library sync — a launch that deferred it would never run it`);
         }
     }
-    const revoked = body('HandleRevokedSession');
-    if (!revoked || !/m\.pendingLibrarySync\s*=\s*false/.test(revoked)) {
-        err('MainScene.brs HandleRevokedSession must clear a deferred library sync — the session is gone and nothing should pull');
+    const addonResult = body('onAddonResult');
+    const libraryResult = body('onLibraryResult');
+    if (!addonResult || !/m\.pendingLibrarySync\s*=\s*false/.test(addonResult) || !libraryResult || !/m\.pendingLibrarySync\s*=\s*false/.test(libraryResult)) {
+        err('AccountSyncCoordinator must clear any deferred library sync when the account session is revoked');
+    }
+    const revoked = scene.match(/sub HandleRevokedSession\(\)[\s\S]*?\nend sub/);
+    if (!revoked || !/callFunc\("CancelPendingLibrarySync"\)/.test(revoked[0])) {
+        err('MainScene.HandleRevokedSession must cancel a library pull deferred by another coordinator before dropping the account session');
     }
     return ok;
 }
@@ -2226,6 +2233,7 @@ function checkAddonSyncTaskContract() {
     const taskXml = read('components/AddonSyncTask.xml');
     const taskBrs = code(read('components/AddonSyncTask.brs'));
     const main = code(read('components/MainScene.brs'));
+    const coordinator = code(read('components/AccountSyncCoordinator.brs'));
     const async = code(read('source/core/AsyncTask.bs'));
     let ok = true;
     const err = (m) => { console.error(m); ok = false; };
@@ -2304,81 +2312,60 @@ function checkAddonSyncTaskContract() {
         }
     }
 
-    // 3. The defect itself: an empty result must be DECLINED, not reaped. This is
-    //    an ordering check, not a presence check — the reap has to come after the
-    //    bail, and there must be no reap before it.
-    const onResult = body(main, 'onAddonSyncResult');
+    // 3. The defect itself: an empty result must be DECLINED, not reaped. The
+    //    coordinator now owns this task lifecycle; the ordering remains pinned.
+    const onResult = body(coordinator, 'onAddonResult');
     if (!onResult) {
-        err('MainScene.brs has no onAddonSyncResult — the sync result has no entry point');
+        err('AccountSyncCoordinator.brs has no onAddonResult — the sync result has no entry point');
     } else {
         const bailAt = /if\s+result\s*=\s*invalid\s+then\s+return/.exec(onResult);
         if (!bailAt) {
-            err('MainScene.brs onAddonSyncResult no longer declines an empty result — an alwaysNotify result that notifies before the worker wrote one is indistinguishable from a real failure, and reaping on it destroys the answer (THE original bug)');
+            err('AccountSyncCoordinator.onAddonResult no longer declines an empty result — reaping an alwaysNotify initial notification destroys the real answer');
         }
         const reapAt = onResult.indexOf('AsyncTask_Reap(');
-        if (reapAt === -1) {
-            err('MainScene.brs onAddonSyncResult never reaps the task — a finished task node would stay in the tree for the life of the scene');
-        } else if (bailAt && reapAt < bailAt.index) {
-            err('MainScene.brs onAddonSyncResult reaps BEFORE it declines an empty result — the node is unobserved and removed while the worker is still running, so the real result can never land (THE original bug)');
-        }
-        // Reporting must have MOVED, not been duplicated. The old shape reported
-        // the empty result from here; that text is the signature of the bug, so
-        // its absence from this sub is what pins the authority. A presence check
-        // alone would pass on a file that did both.
-        if (/reported no result at all/.test(onResult)) {
-            err('MainScene.brs onAddonSyncResult still reports the empty result itself — that report is premature by construction (it cannot know the worker is done) and it is the original bug; the done-callback owns this outcome');
+        if (reapAt === -1 || (bailAt && reapAt < bailAt.index)) {
+            err('AccountSyncCoordinator.onAddonResult must decline an empty result before reaping the task');
         }
         if (!/if\s+result\.revokedSession\s*=\s*true/.test(onResult)) {
-            err('MainScene.brs onAddonSyncResult truthiness-tests result.revokedSession — a result packet without the key reads back invalid, and `if invalid` is a hard &h18 crash on device');
+            err('AccountSyncCoordinator.onAddonResult must route a revoked session to MainScene without truthiness-testing an absent field');
+        }
+        if (!/callFunc\("AdoptAddonSyncResult",\s*result\)/.test(onResult)) {
+            err('AccountSyncCoordinator.onAddonResult must hand a valid result to MainScene for store adoption and screen refreshes');
         }
     }
 
     // 4. The done-callback is the only authority on "the worker finished with
-    //    nothing", and it has to name the stage. Critically it must establish
-    //    that from the sentinel's VALUE, before it reaps or clears anything.
-    const onFinished = body(main, 'onAddonSyncFinished');
+    //    nothing", and it acts only on the sentinel's VALUE.
+    const onFinished = body(coordinator, 'onAddonFinished');
     if (!onFinished) {
-        err('MainScene.brs has no onAddonSyncFinished — with the empty-result path now declining, the worker-finished-with-no-result outcome has no reporter at all and would be silent');
+        err('AccountSyncCoordinator.brs has no onAddonFinished — a worker finishing without a result would be silent');
     } else {
-        // Arrival means nothing. `finished` notifies once at ObserveField time
-        // with value false, and that notification is dispatched on the event
-        // loop, so it lands while the worker is mid-request. Treating arrival as
-        // "done" reaps a live node and publishes a fault read off a task in
-        // flight — which is exactly what shipped and produced
-        //   (stage: request-started) on every first sync.
         const finTest = /if\s+task\.finished\s*<>\s*true\s+then\s+return/.exec(onFinished);
         if (!finTest) {
-            err('MainScene.brs onAddonSyncFinished does not test task.finished\'s VALUE before acting — an alwaysNotify sentinel also notifies at ObserveField time with value false, and that notification is dispatched on the event loop (i.e. while the worker is still running), so arrival is not proof of completion. Reaping on it destroys the in-flight task and reports a stage read from a task that has not finished.');
+            err('AccountSyncCoordinator.onAddonFinished must test the sentinel value before acting; notification arrival alone does not mean done');
         }
-        // Ordering: the value test must precede every destructive action.
         const finAt = finTest ? finTest.index : -1;
-        for (const [needle, what] of [['AsyncTask_Reap(', 'reaps the task'], ['m.addonSyncTask = invalid', 'clears the task slot'], ['AddAddonSyncFault(', 'publishes a fault']]) {
+        for (const [needle, what] of [['AsyncTask_Reap(', 'reaps the task'], ['m.addonTask = invalid', 'clears the task slot'], ['ReportAddonSyncFault(', 'publishes a fault']]) {
             const at = onFinished.indexOf(needle);
             if (at !== -1 && finAt !== -1 && at < finAt) {
-                err(`MainScene.brs onAddonSyncFinished ${what} before testing task.finished — the spurious alwaysNotify notification would then reap a live worker and report a stage read from a task in flight`);
+                err(`AccountSyncCoordinator.onAddonFinished ${what} before testing task.finished — the spurious alwaysNotify notification could reap a live worker`);
             }
         }
-        if (!/AddAddonSyncFault\(/.test(onFinished)) {
-            err('MainScene.brs onAddonSyncFinished does not report a fault — a worker that completes without a result would be indistinguishable from a healthy one');
-        }
-        if (!/task\.stage/.test(onFinished)) {
-            err('MainScene.brs onAddonSyncFinished does not read task.stage into the fault text — the whole point of the stage field is that the failure names its own hop');
-        }
-        if (!/m\.addonSyncTask\s*=\s*invalid/.test(onFinished)) {
-            err('MainScene.brs onAddonSyncFinished does not clear m.addonSyncTask — a stale node would be left in the tree and the next sync\'s result would be dropped as a duplicate');
-        }
-        if (!/AsyncTask_Reap\(/.test(onFinished)) {
-            err('MainScene.brs onAddonSyncFinished never reaps the task — the finished worker\'s node would stay in the tree for the life of the scene');
+        if (!/task\.stage/.test(onFinished) || !/callFunc\("ReportAddonSyncFault"/.test(onFinished) || !/AsyncTask_Reap\(/.test(onFinished)) {
+            err('AccountSyncCoordinator.onAddonFinished must reap the finished worker and report its diagnostic stage');
         }
     }
 
-    // 5. The wiring. Both observers must be attached before control = "RUN" —
-    //    that assignment is the only point at which the worker can start, so an
-    //    observer attached after it can miss its first notification entirely.
-    const start = body(main, 'StartAddonSync');
-    if (!start || !/AsyncTask_Launch\([\s\S]*?"onAddonSyncResult"[\s\S]*?"onAddonSyncFinished"\s*\)/.test(start)) {
-        err('MainScene.brs StartAddonSync does not pass "onAddonSyncFinished" as AsyncTask_Launch\'s done-callback — the sentinel would be set with nothing observing it');
+    // 5. Both observers are attached before RUN by AsyncTask_Launch, and this
+    //    coordinator owns the launch rather than MainScene.
+    const start = body(coordinator, 'StartAddonSync');
+    if (!start || !/AsyncTask_Launch\([\s\S]*?"onAddonResult"[\s\S]*?"onAddonFinished"\s*\)/.test(start)) {
+        err('AccountSyncCoordinator.StartAddonSync must pass the result and done callbacks to AsyncTask_Launch');
     }
+    if (!/callFunc\("StartAddonSync"\)/.test(main)) {
+        err('MainScene.StartAddonSync must delegate the account pull to AccountSyncCoordinator');
+    }
+
     const launch = body(async, 'AsyncTask_Launch');
     if (!launch) {
         err('source/core/AsyncTask.bs has no AsyncTask_Launch');
@@ -2703,15 +2690,15 @@ function checkHomeCatalogStalenessContract() {
 
     // 4. The call sites must be UNCONDITIONAL. This is the defect itself: a
     //    rebuild gated on an install count is false on every re-sync.
-    const onSync = body(main, 'onAddonSyncResult');
+    const onSync = body(main, 'AdoptAddonSyncResult');
     if (!onSync) {
-        err('MainScene.brs has no onAddonSyncResult()');
+        err('MainScene.brs has no AdoptAddonSyncResult()');
     } else {
         if (!/callFunc\(\s*"EnsureCurrentRows"\s*\)/.test(onSync)) {
-            err('MainScene.brs onAddonSyncResult() no longer calls EnsureCurrentRows() — the sync is the authority on "the add-on set may have moved" and it now tells nobody');
+            err('MainScene.brs AdoptAddonSyncResult() no longer calls EnsureCurrentRows() — the sync is the authority on "the add-on set may have moved" and it now tells nobody');
         }
         if (/if\s+added\s*>/.test(onSync)) {
-            err('MainScene.brs onAddonSyncResult() re-gates the rebuild on `added > 0` — an unchanged account installs nothing, so this is false on every run after the first and Home is never told to re-derive. That is the original bug.');
+            err('MainScene.brs AdoptAddonSyncResult() re-gates the rebuild on `added > 0` — an unchanged account installs nothing, so this is false on every run after the first and Home is never told to re-derive. That is the original bug.');
         }
     }
     const importSub = body(main, 'ImportFinished');
